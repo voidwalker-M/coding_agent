@@ -1,0 +1,22 @@
+llm:
+  provider: openai # OpenAI-compatible backend (UF LiteLLM proxy)
+  model: gpt-oss-120b
+  api_key: ${GPT_OSS_API_KEY} # export GPT_OSS_API_KEY=your-key in the terminal (do not write keys in this file)
+  base_url: https://api.ai.it.ufl.edu
+  max_tokens: 8192
+
+agent:
+  max_steps: 40
+  budget_tokens: 80000
+  log_dir: ./logs
+
+tools:
+  shell:
+    timeout: 30 # seconds
+    max_output_tokens: 8000 # truncation length
+  file:
+    max_view_lines: 100 # lines shown per file_view call
+
+context:
+  repo_map_budget: 8000 # max tokens for repo-map
+  history_window: 20 # number of most recent conversation rounds to retain

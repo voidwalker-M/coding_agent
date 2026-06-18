@@ -1,0 +1,22 @@
+// LangGraphAgent state graph (mirrors agent/langgraph_loop.py:run)
+digraph LangGraphAgent {
+    rankdir=TB;
+    bgcolor="white";
+    node [fontname="Helvetica", fontsize=11];
+    edge [fontname="Helvetica", fontsize=9];
+
+    START [shape=circle, style=filled, fillcolor="#111111", fontcolor="white", width=0.5, label="START"];
+    END   [shape=doublecircle, style=filled, fillcolor="#111111", fontcolor="white", width=0.5, label="END"];
+
+    agent [shape=box, style="rounded,filled", fillcolor="#dbeafe",
+           label="agent\n(LLM decides next Action)\nbackend.complete() • log_action"];
+    tools [shape=box, style="rounded,filled", fillcolor="#dcfce7",
+           label="tools\nexecute tool • log_observation\nupdate history • reflection"];
+
+    START -> agent;                                      // set_entry_point("agent")
+    agent -> tools [label="  TOOL_CALL", color="#2563eb", fontcolor="#2563eb"];
+    agent -> END   [label="  FINISH / GIVE_UP / max_steps", color="#b91c1c", fontcolor="#b91c1c", style=dashed];
+    tools -> agent [label="  next step", color="#16a34a", fontcolor="#16a34a"];  // add_edge(tools, agent)
+
+    { rank=same; agent; tools; }
+}
