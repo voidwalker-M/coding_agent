@@ -285,10 +285,13 @@ class Agent:
         """Assemble the full message list to send to the LLM, with token trimming."""
         schemas = self._registry.get_schemas()
 
-        # Build repo-map (cached: generated once on the first step, reused afterward)
+        # Build repo-map (cached: generated once on the first step, reused afterward).
+        # Pass the task description as the query so files relevant to the current
+        # task are ranked first; this is constant within a task, so caching is safe.
         if not hasattr(self, "_repo_map_cache"):
             self._repo_map_cache = repo_map.build(
-                budget=token_budget.default_plan().repo_map
+                budget=token_budget.default_plan().repo_map,
+                query=getattr(self, "_current_task_desc", "") or None,
             )
 
         # RAG retrieval (cached: retrieved once per task description)
@@ -409,6 +412,7 @@ class Agent:
                 if any(kw in exc_str for kw in (
                     "401", "403", "invalid api key", "authentication",
                     "400", "bad request",
+                    "ceiling", "budget exceeded",   # cost ceiling — stop, don't retry
                 )):
                     raise
                 if attempt < self._cfg.llm_max_retries:

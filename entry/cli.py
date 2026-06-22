@@ -88,13 +88,16 @@ def _build_registry(cfg, confirm_callback=None, runtime=None):
     )
 
 
-def _build_retriever(repo_path: str, kind: str, rerank: str = "none", cache: bool = True):
+def _build_retriever(repo_path: str, kind: str, rerank: str = "none", cache: bool = True,
+                     extra_paths=None):
     """
     Build a RAG retriever based on --retriever / --rerank options. Returns None when kind='none'.
 
     Persistent caching (<repo>/.rag_cache) and incremental updates are enabled by default:
     unchanged files reuse cached vectors; only changed files are re-embedded.
     Hybrid retrieval (dense + BM25) is enabled by default.
+
+    extra_paths: external dirs/files (docs, dependency source) indexed alongside the repo (#2).
     """
     if not kind or kind == "none":
         return None
@@ -106,6 +109,7 @@ def _build_retriever(repo_path: str, kind: str, rerank: str = "none", cache: boo
         hybrid=True,
         reranker=(rerank if rerank and rerank != "none" else None),
         cache_dir=cache_dir,
+        extra_paths=list(extra_paths) if extra_paths else None,
     ).build()
     return retriever
 
@@ -195,7 +199,12 @@ def cli(ctx: click.Context, config: str | None) -> None:
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
 @click.option("--retriever", "-R", type=click.Choice(["none", "rag"]), default="none", show_default=True, help="Context retriever: 'rag' enables hybrid (dense+BM25) code retrieval")
 @click.option("--rerank", type=click.Choice(["none", "mmr", "cross-encoder"]), default="none", show_default=True, help="Rerank retrieved chunks: 'mmr' (numpy, diversity) or 'cross-encoder' (needs sentence-transformers)")
+@click.option("--rag-extra", multiple=True, type=click.Path(), help="External dir/file to index with RAG (docs, dependency source). Repeatable. Implies --retriever rag")
 @click.option("--engine", "-e", type=click.Choice(["native", "langgraph"]), default="native", show_default=True, help="Orchestration engine: 'langgraph' runs the LangGraph port")
+@click.option("--cache", is_flag=True, default=False, help="Cache LLM responses (saves tokens on repeated/identical calls)")
+@click.option("--cheap-model", default=None, help="Enable cost-aware routing: send easy steps to this cheaper model")
+@click.option("--max-usd", default=None, type=float, help="Hard spend ceiling in USD for this run (stops when exceeded)")
+@click.option("--rpm", default=None, type=int, help="Throttle LLM calls to at most this many requests per minute")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
 def run(
@@ -211,7 +220,12 @@ def run(
     sandbox: bool,
     retriever: str,
     rerank: str,
+    rag_extra: tuple,
     engine: str,
+    cache: bool,
+    cheap_model: str | None,
+    max_usd: float | None,
+    rpm: int | None,
     verbose: bool,
 ) -> None:
     """Run the coding agent on a repository."""
@@ -262,15 +276,38 @@ def run(
         click.echo(red(f"Error: {e}"), err=True)
         sys.exit(1)
 
+    # Token-efficiency layers (#4): cost-aware routing, response cache, rate/$ limit.
+    if cache or cheap_model or max_usd is not None or rpm is not None:
+        from llm.compose import compose_backend
+        cheap_backend = None
+        if cheap_model:
+            cheap_backend = create_backend_from_config({
+                "provider": config.llm.provider, "model": cheap_model,
+                "api_key": config.llm.api_key or None, "base_url": config.llm.base_url or None,
+                "max_tokens": config.llm.max_tokens,
+            })
+        backend = compose_backend(
+            backend, cheap=cheap_backend, cache=cache,
+            rpm=rpm, max_usd=max_usd, model_for_cost=config.llm.model,
+        )
+        extras = [n for n, on in (("cache", cache), ("router", bool(cheap_model)),
+                                  ("max_usd", max_usd is not None), ("rpm", rpm is not None)) if on]
+        click.echo(dim(f"  Token-saving: {', '.join(extras)}"))
+
     from tools.shell_tool import terminal_confirm
     from tools.runtime import create_runtime
     confirm_cb = terminal_confirm if confirm else None
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
     if sandbox:
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
-    rag_retriever = _build_retriever(str(repo_path), retriever, rerank=rerank)
+    # --rag-extra implies enabling RAG even if --retriever wasn't passed.
+    if rag_extra and retriever == "none":
+        retriever = "rag"
+    rag_retriever = _build_retriever(str(repo_path), retriever, rerank=rerank, extra_paths=rag_extra)
     if rag_retriever is not None:
         click.echo(dim(f"  Retriever: RAG ({rag_retriever.chunk_count} chunks, {rag_retriever.backend_info})"))
+        if rag_extra:
+            click.echo(dim(f"  RAG external: {', '.join(rag_extra)}"))
     registry = _build_registry(config, confirm_callback=confirm_cb, runtime=runtime)
 
     from agent.core import Agent, AgentConfig
@@ -506,6 +543,158 @@ def chat(
 
 
 # ---------------------------------------------------------------------------
+# web subcommand — browser chat box (#1)
+# ---------------------------------------------------------------------------
+
+@cli.command("web")
+@click.option("--repo", "-r", default=".", show_default=True, help="Path to the target repository")
+@click.option("--model", "-m", default=None, help="Override LLM model name")
+@click.option("--provider", "-p", default=None, help="Override LLM provider")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Bind host")
+@click.option("--port", default=8765, show_default=True, type=int, help="Bind port")
+@click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
+@click.pass_context
+def web(
+    ctx: click.Context,
+    repo: str,
+    model: str | None,
+    provider: str | None,
+    host: str,
+    port: int,
+    verbose: bool,
+) -> None:
+    """Serve a browser chat box for the agent (stdlib-only web server)."""
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)-7s %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    config = load_config(ctx.obj.get("config_path"))
+    config = merge_cli_overrides(config, provider=provider, model=model)
+
+    repo_path = Path(repo).resolve()
+    if not repo_path.exists():
+        click.echo(red(f"Error: repo path does not exist: {repo_path}"), err=True)
+        sys.exit(1)
+
+    try:
+        backend = create_backend_from_config({
+            "provider":   config.llm.provider,
+            "model":      config.llm.model,
+            "api_key":    config.llm.api_key or None,
+            "base_url":   config.llm.base_url or None,
+            "max_tokens": config.llm.max_tokens,
+        })
+    except ValueError as e:
+        click.echo(red(f"Error: {e}"), err=True)
+        sys.exit(1)
+
+    registry = _build_registry(config)
+    from entry.web import ChatWebApp, serve
+    app = ChatWebApp(backend, registry, config, str(repo_path), config.agent.log_dir)
+
+    click.echo(bold(f"\n🌐 Coding Agent — Web Chat"))
+    click.echo(f"  Provider : {config.llm.provider}")
+    click.echo(f"  Model    : {config.llm.model}")
+    click.echo(f"  Repo     : {repo_path}")
+    click.echo(green(f"  Open     : http://{host}:{port}\n"))
+    click.echo(dim("  Ctrl+C to stop.\n"))
+    serve(app, host=host, port=port)
+
+
+# ---------------------------------------------------------------------------
+# multi subcommand — multi-agent orchestrator (#3)
+# ---------------------------------------------------------------------------
+
+@cli.command("multi")
+@click.option("--repo", "-r", default=".", show_default=True, help="Path to the target repository")
+@click.option("--task", "-t", default=None, help="Task description (natural language)")
+@click.option("--task-file", "-f", default=None, help="Read task description from file")
+@click.option("--model", "-m", default=None, help="Override LLM model name")
+@click.option("--provider", "-p", default=None, help="Override LLM provider")
+@click.option("--max-steps", default=None, type=int, help="Max steps per role")
+@click.option("--iterations", "-i", default=2, show_default=True, type=int, help="Max coder/reviewer iterations")
+@click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox")
+@click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
+@click.pass_context
+def multi(
+    ctx: click.Context,
+    repo: str,
+    task: str | None,
+    task_file: str | None,
+    model: str | None,
+    provider: str | None,
+    max_steps: int | None,
+    iterations: int,
+    sandbox: bool,
+    verbose: bool,
+) -> None:
+    """Run the planner → coder → reviewer multi-agent pipeline on a task."""
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)-7s %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    config = load_config(ctx.obj.get("config_path"))
+    config = merge_cli_overrides(config, provider=provider, model=model, max_steps=max_steps)
+
+    if task_file:
+        description = Path(task_file).read_text(encoding="utf-8").strip()
+    elif task:
+        description = task
+    else:
+        click.echo(red("Error: provide --task or --task-file"), err=True)
+        sys.exit(1)
+
+    repo_path = Path(repo).resolve()
+    if not repo_path.exists():
+        click.echo(red(f"Error: repo path does not exist: {repo_path}"), err=True)
+        sys.exit(1)
+
+    try:
+        backend = create_backend_from_config({
+            "provider": config.llm.provider, "model": config.llm.model,
+            "api_key": config.llm.api_key or None, "base_url": config.llm.base_url or None,
+            "max_tokens": config.llm.max_tokens,
+        })
+    except ValueError as e:
+        click.echo(red(f"Error: {e}"), err=True)
+        sys.exit(1)
+
+    from tools.runtime import create_runtime
+    runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
+    registry = _build_registry(config, runtime=runtime)
+
+    from agent.core import AgentConfig
+    from agent.orchestrator import Orchestrator
+    from agent.task import Task
+
+    agent_cfg = AgentConfig(max_steps=config.agent.max_steps, budget_tokens=config.agent.budget_tokens)
+
+    click.echo(bold(f"\n🤝 Coding Agent — Multi-Agent (planner → coder → reviewer)"))
+    click.echo(f"  Model    : {config.llm.model}   Iterations: {iterations}")
+    click.echo(f"  Repo     : {repo_path}\n")
+
+    def _on_role(role: str) -> None:
+        click.echo(cyan(f"  ▶ {role}…"))
+
+    orch = Orchestrator(backend, registry, agent_cfg,
+                        max_iterations=iterations, on_role_start=_on_role)
+    task_obj = Task(description=description, repo_path=str(repo_path),
+                    max_steps=config.agent.max_steps)
+    result = orch.run(task_obj, log_dir=config.agent.log_dir)
+
+    click.echo(bold("\n" + "─" * 60))
+    verdict = green("APPROVED") if result.approved else red("NOT APPROVED")
+    click.echo(f"Verdict   : {verdict}  (after {result.iterations} iteration(s))")
+    click.echo(f"Steps     : {result.total_steps}   Tokens: {result.total_tokens:,}")
+    for r in result.roles:
+        click.echo(dim(f"    {r.role:<9} {r.status:<10} {r.steps} steps  {r.tokens} tok"))
+    click.echo(bold("─" * 60) + "\n")
+    sys.exit(0 if result.is_success() else 1)
+
+
+# ---------------------------------------------------------------------------
 # eval subcommand — benchmark harness
 # ---------------------------------------------------------------------------
 
@@ -513,6 +702,7 @@ def chat(
 @click.option("--model", "-m", default=None, help="Override LLM model name")
 @click.option("--provider", "-p", default=None, help="Override LLM provider")
 @click.option("--max-steps", default=None, type=int, help="Override per-task max steps")
+@click.option("--attempts", "-k", default=1, type=int, show_default=True, help="Run each task k times for pass@1 / pass@k")
 @click.option("--retriever", "-R", type=click.Choice(["none", "rag"]), default="none", show_default=True, help="Context retriever for each task")
 @click.option("--engine", "-e", type=click.Choice(["native", "langgraph"]), default="native", show_default=True, help="Orchestration engine")
 @click.option("--output", "-o", default=None, help="Save the JSON report to this path")
@@ -525,6 +715,7 @@ def eval_cmd(
     model: str | None,
     provider: str | None,
     max_steps: int | None,
+    attempts: int,
     retriever: str,
     engine: str,
     output: str | None,
@@ -576,7 +767,7 @@ def eval_cmd(
     click.echo(f"  Provider : {config.llm.provider}")
     click.echo(f"  Model    : {config.llm.model}")
     click.echo(f"  Engine   : {engine}   Retriever: {retriever}")
-    click.echo(f"  Tasks    : {len(suite)}\n")
+    click.echo(f"  Tasks    : {len(suite)}   Attempts: {attempts}\n")
 
     def _progress(r) -> None:
         verdict = green("PASS") if r.passed else red("FAIL")
@@ -589,8 +780,9 @@ def eval_cmd(
         results_dir=results_dir,
         keep_workdirs=keep,
         on_result=_progress,
+        model_name=config.llm.model,
     )
-    report = harness.run_suite(suite)
+    report = harness.run_suite(suite, attempts=attempts)
 
     click.echo("\n" + report.format_table() + "\n")
 

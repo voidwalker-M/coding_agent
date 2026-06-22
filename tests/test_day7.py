@@ -248,10 +248,10 @@ class TestRepoMapCache:
         build_call_count = 0
         original_build = __import__("context.repo_map", fromlist=["RepoMap"]).RepoMap.build
 
-        def counting_build(self, budget=8000):
+        def counting_build(self, budget=8000, query=None):
             nonlocal build_call_count
             build_call_count += 1
-            return original_build(self, budget)
+            return original_build(self, budget, query)
 
         with patch("context.repo_map.RepoMap.build", counting_build):
             agent = Agent(backend, registry)

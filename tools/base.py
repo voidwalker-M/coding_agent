@@ -127,6 +127,23 @@ class ToolRegistry:
         self._tools[tool.name] = tool
         return self
 
+    @property
+    def tool_names(self) -> list[str]:
+        """Names of all registered tools."""
+        return list(self._tools)
+
+    def subset(self, names) -> "ToolRegistry":
+        """
+        Return a new registry containing only the named tools (missing names are
+        skipped). Used by the multi-agent orchestrator to give each role a
+        restricted tool set (e.g. read-only for the planner/reviewer).
+        """
+        r = ToolRegistry()
+        for n in names:
+            if n in self._tools:
+                r._tools[n] = self._tools[n]
+        return r
+
     def execute_tool(self, name: str, params: dict[str, Any]) -> ToolResult:
         """
         Look up a tool by name and execute it.

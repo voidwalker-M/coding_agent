@@ -198,10 +198,10 @@ class TestChatEdgeCases:
         from context import repo_map as rm_module
         original_build = rm_module.RepoMap.build
 
-        def counting_build(self, budget=8000):
+        def counting_build(self, budget=8000, query=None):
             nonlocal build_count
             build_count += 1
-            return original_build(self, budget)
+            return original_build(self, budget, query)
 
         from unittest.mock import patch
         script = [

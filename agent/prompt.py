@@ -42,6 +42,14 @@ explore the repository, make the necessary code changes, and verify they work co
 - Make the smallest change that fixes the problem
 - When done, call finish. If you truly cannot solve it, call give_up with an explanation
 
+## Efficiency (minimize wasted tokens)
+- Do NOT re-read a file you have already read in this conversation — reuse what you saw
+- Prefer targeted tools (find_symbol, search_text, file_view of a line range) over reading
+  whole files or running broad `cat`/`grep` that dump large output
+- Keep the thought field concise: a sentence or two of reasoning, not an essay
+- Use the repository summary above to locate code before opening files
+- One purposeful action per step; avoid speculative exploration once you can edit
+
 ## Repository
 Path: {repo_path}
 {repo_summary}

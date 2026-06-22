@@ -19,6 +19,7 @@ from eval.verifiers import (
     CommandVerifier,
     FileContainsVerifier,
     PytestVerifier,
+    UnmodifiedFilesVerifier,
 )
 
 
@@ -108,5 +109,51 @@ def default_suite() -> list[TaskSpec]:
                 PytestVerifier(),
             ),
             max_steps=15,
+        ),
+
+        # 5. Multi-file navigation: the bug is in ONE of several modules.
+        #    Exercises the repo-map (find the right file) AND penalizes
+        #    over-editing (the agent must not touch the distractor modules).
+        TaskSpec(
+            id="bugfix_multi_file",
+            description=(
+                "A store package has a bug: format_price() in store/format.py is "
+                "supposed to turn an integer number of cents into a dollar string, "
+                "e.g. 1050 -> '$10.50', but it is wrong and test_format.py fails. "
+                "Find and fix the bug in store/format.py only. Do not modify any "
+                "other module. Run the tests to verify."
+            ),
+            setup_files={
+                "store/__init__.py": "",
+                "store/inventory.py": (
+                    "def in_stock(item, qty):\n"
+                    "    return qty > 0\n\n"
+                    "def restock(item, qty):\n"
+                    "    return qty\n"
+                ),
+                "store/cart.py": (
+                    "def subtotal(prices):\n"
+                    "    return sum(prices)\n\n"
+                    "def item_count(items):\n"
+                    "    return len(items)\n"
+                ),
+                # The bug: returns raw cents, not dollars.
+                "store/format.py": (
+                    "def format_price(cents):\n"
+                    "    return f\"${cents}\"\n"
+                ),
+                "test_format.py": (
+                    "from store.format import format_price\n\n"
+                    "def test_format_price():\n"
+                    "    assert format_price(1050) == '$10.50'\n"
+                    "    assert format_price(99) == '$0.99'\n"
+                    "    assert format_price(100) == '$1.00'\n"
+                ),
+            },
+            verify=AllOfVerifier(
+                PytestVerifier(),
+                UnmodifiedFilesVerifier("store/inventory.py", "store/cart.py"),
+            ),
+            max_steps=20,
         ),
     ]
