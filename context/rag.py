@@ -159,6 +159,44 @@ def _iter_source_files(root: Path):
         yield path, str(path.relative_to(root)), content
 
 
+# External file library (#2): index docs / dependency source / reference material
+# that lives OUTSIDE the repo. Allow common doc formats in addition to source code.
+_DOC_EXTS: frozenset[str] = frozenset({
+    ".md", ".markdown", ".rst", ".txt", ".text",
+})
+_EXTERNAL_EXTS: frozenset[str] = _SOURCE_EXTS | _DOC_EXTS
+
+
+def _iter_external_files(paths):
+    """
+    Iterate over files in an external library (dirs and/or single files) that
+    participate in retrieval. Yields (Path, relative_str, content) where the
+    relative path is namespaced under 'external/<label>/...' so external chunks
+    never collide with repo paths and are clearly marked in retrieved context.
+    """
+    for raw in paths:
+        p = Path(raw).expanduser().resolve()
+        if p.is_file():
+            files = [(p, p.name)]
+        elif p.is_dir():
+            files = [(c, f"{p.name}/{c.relative_to(p)}") for c in sorted(p.rglob("*"))]
+        else:
+            logger.warning("RAG external path not found, skipping: %s", p)
+            continue
+        for path, rel in files:
+            if any(part in _SKIP_DIRS for part in path.parts):
+                continue
+            if not path.is_file() or path.suffix.lower() not in _EXTERNAL_EXTS:
+                continue
+            try:
+                if path.stat().st_size > _MAX_FILE_BYTES:
+                    continue
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            yield path, f"external/{rel}", content
+
+
 class Chunker:
     """Chunk repo files into fixed line-window chunks (fallback chunker)."""
 
@@ -860,8 +898,11 @@ class RagRetriever:
         reranker: "str | Reranker | None" = None,
         cache_dir: str | Path | None = None,
         multi_query: bool = False,
+        extra_paths: "list[str | Path] | None" = None,
     ) -> None:
         self._root = Path(repo_path).resolve()
+        # External file library (#2): extra dirs/files indexed alongside the repo.
+        self._extra_paths = list(extra_paths) if extra_paths else []
         self._embeddings = embeddings or create_embedding_backend()
         self._chunker = create_chunker(syntax_aware, chunk_lines, overlap)
         self._hybrid = hybrid
@@ -910,7 +951,14 @@ class RagRetriever:
         pending: list[tuple[int, int]] = []   # (ordered index, chunk count)
         pending_texts: list[str] = []
 
-        for _path, rel, content in _iter_source_files(self._root):
+        # Repo files first, then any external library files (#2). External chunks
+        # use 'external/<label>/...' rel paths, so they cache and dedupe cleanly.
+        source_iter = _iter_source_files(self._root)
+        if self._extra_paths:
+            import itertools
+            source_iter = itertools.chain(source_iter, _iter_external_files(self._extra_paths))
+
+        for _path, rel, content in source_iter:
             h = _sha(content)
             if rel in cached and cached[rel][0] == h:
                 _, chunks, vecs = cached[rel]

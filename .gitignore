@@ -8,3 +8,13 @@ __pycache__/
 .env
 *.env.*
 *.DS_Store
+
+# Generated run artifacts / caches (may contain repo content; keep local)
+.rag_cache/
+eval_runs/
+
+# Session-generated documentation — intentionally NOT published
+docs/CODING_AGENT_ARTICLE.md
+docs/PERFORMANCE_COMPARISON.md
+docs/READING_LIST.md
+docs/UPGRADES.md

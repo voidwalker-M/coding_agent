@@ -120,6 +120,34 @@ class TestRepoMap:
         result = rm.build()
         assert "big.py" not in result
 
+    def test_query_aware_ranking_promotes_relevant_file(self, tmp_path):
+        # A big, structurally "important" but task-irrelevant file
+        (tmp_path / "payments.py").write_text(
+            "def charge():\n    pass\n"
+            + "\n".join(f"def f{i}():\n    pass" for i in range(20))
+        )
+        # A small file directly relevant to a 'token budget' task
+        (tmp_path / "token_budget.py").write_text(
+            "def trim_history():\n    pass\n\ndef estimate_tokens():\n    pass\n"
+        )
+        rm = RepoMap(tmp_path)
+
+        # Without a query, the structurally important file ranks first.
+        no_query = rm.build(budget=10_000)
+        assert no_query.index("payments.py") < no_query.index("token_budget.py")
+
+        # With a relevant query, the relevant file is promoted and marked.
+        with_query = rm.build(budget=10_000, query="fix token budget trimming")
+        assert with_query.index("token_budget.py") < with_query.index("payments.py")
+        assert "★ token_budget.py" in with_query
+
+    def test_query_aware_falls_back_when_no_match(self, tmp_path):
+        # An empty/irrelevant query must not change behavior or add markers.
+        (tmp_path / "a.py").write_text("def alpha():\n    pass\n")
+        rm = RepoMap(tmp_path)
+        assert rm.build(budget=10_000, query=None) == rm.build(budget=10_000)
+        assert "★" not in rm.build(budget=10_000, query="zzzznomatch")
+
 
 class TestExtractPythonSymbols:
     def test_extracts_function(self, tmp_path):

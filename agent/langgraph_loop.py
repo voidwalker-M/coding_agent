@@ -174,7 +174,10 @@ class LangGraphAgent:
         # Build context (system prompt: repo-map + optional RAG)
         repo_map = RepoMap(task.repo_path)
         token_budget = TokenBudget(total=self._cfg.budget_tokens)
-        repo_summary = repo_map.build(budget=token_budget.default_plan().repo_map)
+        repo_summary = repo_map.build(
+            budget=token_budget.default_plan().repo_map,
+            query=task.description or None,
+        )
         rag_context = self._build_rag_context(task.description)
         schemas = self._registry.get_schemas()
 

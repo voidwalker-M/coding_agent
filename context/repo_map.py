@@ -80,6 +80,46 @@ _SYMBOL_RE = re.compile(
     re.MULTILINE,
 )
 
+# ---------------------------------------------------------------------------
+# Query-aware ranking helpers
+#
+# To make the repo-map relevant to the *current task* (not just globally
+# "important" files), we score each file by lexical overlap between the task
+# description and the file's path + symbol names. This is intentionally cheap
+# (no embeddings / no network): a missing or empty query degrades silently to
+# the original structural-only ordering.
+# ---------------------------------------------------------------------------
+
+# Common English + boilerplate words that carry no signal for ranking.
+_STOPWORDS: frozenset[str] = frozenset({
+    "the", "and", "for", "with", "this", "that", "from", "into", "use", "using",
+    "add", "fix", "bug", "issue", "make", "want", "need", "please", "code",
+    "file", "files", "function", "method", "class", "test", "tests", "should",
+    "would", "could", "when", "then", "else", "have", "has", "not", "but",
+    "can", "all", "any", "new", "old", "get", "set", "run", "via", "are",
+})
+
+# Split an identifier token into camelCase / PascalCase / snake_case sub-words.
+_CAMEL_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z0-9]+|[A-Z]+|[0-9]+")
+
+
+def _tokenize(text: str) -> set[str]:
+    """
+    Lowercase, split on non-alphanumerics, further split camelCase / snake_case,
+    drop stopwords and tokens shorter than 3 chars. Returns a set of terms.
+
+    Example:
+        "fix the trimHistory token budget" -> {"trim", "history", "token", "budget"}
+    """
+    terms: set[str] = set()
+    for raw in re.findall(r"[A-Za-z0-9]+", text or ""):
+        parts = _CAMEL_RE.findall(raw) or [raw]
+        for p in parts:
+            p = p.lower()
+            if len(p) >= 3 and p not in _STOPWORDS:
+                terms.add(p)
+    return terms
+
 # Cache of loaded tree-sitter Language objects (avoids repeated imports)
 _lang_cache: dict[str, object] = {}   # ext → Language or None
 
@@ -135,6 +175,7 @@ class FileInfo:
     path: Path
     size: int
     symbols: list[Symbol] = field(default_factory=list)
+    relevance: float = 0.0   # query relevance for the current task (0 = no query / no match)
 
     @property
     def rel_path(self) -> str:
@@ -144,6 +185,30 @@ class FileInfo:
         top_level = sum(1 for s in self.symbols if s.is_toplevel)
         size_penalty = self.size / 10_000
         return top_level - size_penalty
+
+    def relevance_score(self, query_terms: set[str]) -> float:
+        """
+        Lexical relevance of this file to the task query.
+
+        A path match (e.g. query term "budget" appearing in "token_budget.py")
+        is a strong signal, so it is weighted higher than a match on a symbol
+        name. Each query term counts at most once to avoid a file with many
+        repetitive symbols dominating.
+        """
+        if not query_terms:
+            return 0.0
+        path_terms = _tokenize(self.rel_path)
+        symbol_terms: set[str] = set()
+        for s in self.symbols:
+            symbol_terms |= _tokenize(s.name)
+
+        score = 0.0
+        for term in query_terms:
+            if term in path_terms:
+                score += 3.0       # filename/path match: strong
+            elif term in symbol_terms:
+                score += 1.0       # symbol-name match: weaker
+        return score
 
 
 # ---------------------------------------------------------------------------
@@ -162,16 +227,36 @@ class RepoMap:
     def __init__(self, repo_path: str | Path) -> None:
         self._root = Path(repo_path).resolve()
 
-    def build(self, budget: int = 8000) -> str:
+    def build(self, budget: int = 8000, query: str | None = None) -> str:
+        """
+        Build the repo-map summary string.
+
+        Args:
+            budget: token budget for the summary (approximated as budget * 4 chars).
+            query:  optional task description. When provided, files lexically
+                    relevant to the task are ranked first (and marked), so the
+                    most useful files survive the budget cut. When omitted, falls
+                    back to the original structural-importance ordering.
+        """
         files = self._scan()
         if not files:
             return "(empty repository)"
 
-        files.sort(key=lambda f: f.importance_score(), reverse=True)
+        query_terms = _tokenize(query) if query else set()
+        for fi in files:
+            fi.relevance = fi.relevance_score(query_terms)
+
+        # Primary key: query relevance (relevant files first); tie-break by
+        # structural importance. With no query, relevance is 0 for all files and
+        # this reduces to the original importance-only ordering.
+        files.sort(key=lambda f: (f.relevance, f.importance_score()), reverse=True)
 
         lines: list[str] = []
         char_count = 0
         max_chars = budget * 4
+
+        if query_terms and any(f.relevance > 0 for f in files):
+            lines.append("# Files most relevant to the task are listed first (marked ★).")
 
         for fi in files:
             block = self._format_file(fi)
@@ -210,7 +295,8 @@ class RepoMap:
 
     def _format_file(self, fi: FileInfo) -> str:
         sym_count = len(fi.symbols)
-        header = f"{fi.rel_path}"
+        marker = "★ " if fi.relevance > 0 else ""
+        header = f"{marker}{fi.rel_path}"
         if sym_count:
             header += f" ({sym_count} symbol{'s' if sym_count != 1 else ''})"
 
