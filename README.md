@@ -1,5 +1,7 @@
 # Coding Agent
 
+[![Repo Views](https://visitor-badge.laobi.icu/badge?page_id=voidwalker-M.coding_agent&left_text=Repo%20Views)](https://github.com/voidwalker-M/coding_agent)
+
 An autonomous coding agent. Give it a task description and it explores the codebase, edits files, and runs tests until the task is complete.
 
 Supports **Claude, DeepSeek, OpenAI, Groq, Ollama** and more, with built-in streaming output, Docker sandboxing, and GitHub Issue auto-fix.
