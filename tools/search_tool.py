@@ -14,6 +14,7 @@ Design notes:
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -201,13 +202,21 @@ class FindFilesTool(BaseTool):
 
 class FindSymbolTool(BaseTool):
     """
-    Find function/class definitions in Python files.
-    Uses regex to match def / class statements; can be replaced with tree-sitter for precision.
+    Find function/class/method definitions by name.
+
+    When a prebuilt SymbolIndex is supplied it answers from the index — O(1)
+    exact / O(distinct-names) prefix, no disk access, and tree-sitter-accurate
+    across all supported languages. Without one it falls back to the original
+    regex scan over Python files (so the tool works standalone in tests).
 
     params:
-        symbol (str): function or class name (partial match supported)
-        path (str):   root directory to search (default current directory)
+        symbol (str): function or class name (prefix match supported)
+        path (str):   restrict results to this path prefix (default: whole repo)
     """
+
+    def __init__(self, index=None) -> None:
+        # index: an optional context.symbol_index.SymbolIndex (already built).
+        self._index = index
 
     @property
     def name(self) -> str:
@@ -216,9 +225,9 @@ class FindSymbolTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Find function or class definitions in Python files. "
-            "Searches for 'def symbol' or 'class symbol' patterns. "
-            "Supports partial name matching."
+            "Find function, class, or method definitions by name (prefix match). "
+            "Returns file:line for each definition. Prefer this over reading whole "
+            "files to locate code."
         )
 
     @property
@@ -228,11 +237,11 @@ class FindSymbolTool(BaseTool):
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "Function or class name to find (partial match supported)",
+                    "description": "Function/class/method name to find (prefix match supported)",
                 },
                 "path": {
                     "type": "string",
-                    "description": "Root directory to search in (default: current directory)",
+                    "description": "Restrict results to this path prefix (default: whole repo)",
                 },
             },
             "required": ["symbol"],
@@ -240,11 +249,54 @@ class FindSymbolTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         symbol = params.get("symbol", "")
-        search_path = Path(params.get("path", "."))
-
         if not symbol:
             return ToolResult(success=False, output="", error="symbol is required")
 
+        if self._index is not None:
+            return self._execute_indexed(symbol, params.get("path"))
+        return self._execute_scan(symbol, Path(params.get("path", ".")))
+
+    def _execute_indexed(self, symbol: str, path: str | None) -> ToolResult:
+        try:
+            locs = self._index.lookup(
+                symbol, mode="prefix",
+                path_prefix=self._normalize_prefix(path), limit=MAX_RESULTS)
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=f"symbol index error: {exc}")
+        if not locs:
+            return ToolResult(success=True, output=f"No definition found for '{symbol}'")
+        return ToolResult(success=True, output="\n".join(loc.format() for loc in locs))
+
+    def _normalize_prefix(self, path: str | None) -> str | None:
+        """Turn a user-supplied `path` into an index-relative prefix.
+
+        Indexed paths are repo-relative, but a model may pass the repo root as "."
+        or as an absolute path (the old tool took `path` as a search *root*, so
+        "." was its default). Left unnormalized those match nothing and the agent
+        would wrongly conclude the symbol does not exist. Anything denoting the
+        repo root — or a path outside it — becomes "no filter".
+        """
+        if not path:
+            return None
+        p = str(path).strip()
+        if p in (".", "./", "/"):
+            return None
+        if p.startswith("./"):
+            p = p[2:]
+        if os.path.isabs(p):
+            root = getattr(self._index, "root", None)
+            if root is None:
+                return None
+            try:
+                rel = os.path.relpath(p, str(root))
+            except ValueError:              # e.g. different drive on Windows
+                return None
+            if rel == "." or rel.startswith(".."):
+                return None                 # the root itself, or outside the repo
+            p = rel
+        return p or None
+
+    def _execute_scan(self, symbol: str, search_path: Path) -> ToolResult:
         # Match "def foo" / "class Foo" (including indented forms for methods)
         pattern = re.compile(
             rf"^(\s*)(def|class)\s+({re.escape(symbol)}\w*)\s*[:(]",

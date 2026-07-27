@@ -122,6 +122,11 @@ class LocalRuntime(Runtime):
     def name(self) -> str:
         return "local"
 
+    def _env(self) -> dict[str, str] | None:
+        """Environment for the subprocess; None inherits the parent's (the default).
+        Subclasses override this to run commands inside a specific environment."""
+        return None
+
     def exec(
         self,
         cmd: str,
@@ -136,6 +141,7 @@ class LocalRuntime(Runtime):
                 text=True,
                 timeout=timeout,
                 cwd=cwd,
+                env=self._env(),
             )
             return RunResult(
                 returncode=proc.returncode,
@@ -150,6 +156,51 @@ class LocalRuntime(Runtime):
             )
         except Exception as e:
             return RunResult(returncode=-1, stdout="", stderr=str(e))
+
+
+# ---------------------------------------------------------------------------
+# VenvRuntime — local subprocess inside a virtualenv
+# ---------------------------------------------------------------------------
+
+class VenvRuntime(LocalRuntime):
+    """
+    Local execution with a virtualenv activated.
+
+    Prepends <venv>/bin to PATH and sets VIRTUAL_ENV, so `python`, `pip` and any
+    console scripts resolve inside that environment instead of the agent's own.
+
+    Why this exists: when the agent works on a repository whose dependencies live
+    in a separate environment (e.g. a SWE-bench instance pinned to an old Python
+    and old library versions), running `pytest` with the agent's interpreter fails
+    on imports — the agent then cannot execute the project's tests to check its
+    own fix, and is reduced to editing blind. Pointing the tool layer at the
+    project's venv restores the read → edit → test → repair loop.
+
+    Args:
+        venv_path: path to the virtualenv root (the dir containing bin/)
+    """
+
+    def __init__(self, venv_path: str | Path) -> None:
+        self._venv = Path(venv_path).resolve()
+
+    @property
+    def name(self) -> str:
+        return f"venv({self._venv.name})"
+
+    @property
+    def python(self) -> Path:
+        return self._venv / "bin" / "python"
+
+    def _env(self) -> dict[str, str]:
+        import os
+        env = dict(os.environ)
+        env["VIRTUAL_ENV"] = str(self._venv)
+        env["PATH"] = f"{self._venv / 'bin'}{os.pathsep}{env.get('PATH', '')}"
+        # PYTHONHOME would override the venv's prefix; PYTHONPATH could leak the
+        # agent's own site-packages into the project's interpreter.
+        env.pop("PYTHONHOME", None)
+        env.pop("PYTHONPATH", None)
+        return env
 
 
 # ---------------------------------------------------------------------------

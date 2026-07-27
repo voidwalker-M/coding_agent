@@ -189,6 +189,10 @@ class FileWriteTool(BaseTool):
         content (str): content to write
     """
 
+    def __init__(self, undo_manager: "UndoManager | None" = None) -> None:
+        from tools.undo_tool import UndoManager
+        self._undo = undo_manager or UndoManager()
+
     @property
     def name(self) -> str:
         return "file_write"
@@ -222,6 +226,7 @@ class FileWriteTool(BaseTool):
         path = Path(params.get("path", ""))
         content = params.get("content", "")
 
+        self._undo.snapshot_from_disk("file_write", str(path))
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
@@ -232,4 +237,114 @@ class FileWriteTool(BaseTool):
         return ToolResult(
             success=True,
             output=f"Written {line_count} lines to {path}",
+        )
+
+
+class FileEditTool(BaseTool):
+    """
+    Make a surgical edit to an existing file by replacing an exact string.
+
+    This is the preferred way to change existing files: unlike file_write it does
+    NOT require reproducing the whole file, so a small, targeted change stays
+    small and cannot accidentally destroy the rest of the file. old_string must
+    match the file exactly (including indentation) and must be unique.
+
+    params:
+        path (str):       file path
+        old_string (str): exact text to find (must appear exactly once)
+        new_string (str): text to replace it with
+    """
+
+    def __init__(self, undo_manager: "UndoManager | None" = None) -> None:
+        from tools.undo_tool import UndoManager
+        self._undo = undo_manager or UndoManager()
+
+    @property
+    def name(self) -> str:
+        return "file_edit"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Replace an exact string in an existing file with new text. PREFER THIS "
+            "over file_write for modifying existing files — you only provide the "
+            "snippet to change, not the whole file. `old_string` must match the file "
+            "exactly (copy it verbatim, including indentation and surrounding lines) "
+            "and must be unique; include a few extra lines of context if needed to "
+            "make it unique. Read the file first to get the exact text."
+        )
+
+    @property
+    def parameters_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to edit",
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact text to find and replace (must be unique in the file)",
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Text to replace old_string with",
+                },
+            },
+            "required": ["path", "old_string", "new_string"],
+        }
+
+    def execute(self, params: dict[str, Any]) -> ToolResult:
+        path = Path(params.get("path", ""))
+        old_string = params.get("old_string", "")
+        new_string = params.get("new_string", "")
+
+        if not path or not str(path):
+            return ToolResult(success=False, output="", error="path is required")
+        if not old_string:
+            return ToolResult(
+                success=False, output="",
+                error="old_string is required and must be non-empty. To create a new "
+                      "file or fully rewrite one, use file_write instead.",
+            )
+        if not path.exists():
+            return ToolResult(success=False, output="", error=f"{path} does not exist")
+
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as e:
+            return ToolResult(success=False, output="", error=str(e))
+
+        occurrences = content.count(old_string)
+        if occurrences == 0:
+            return ToolResult(
+                success=False, output="",
+                error="old_string not found in the file. Read the file again and copy "
+                      "the exact text (whitespace and indentation must match).",
+            )
+        if occurrences > 1:
+            return ToolResult(
+                success=False, output="",
+                error=f"old_string appears {occurrences} times; it must be unique. "
+                      "Include more surrounding lines of context to disambiguate.",
+            )
+        if old_string == new_string:
+            return ToolResult(success=False, output="",
+                              error="old_string and new_string are identical — nothing to change.")
+
+        updated = content.replace(old_string, new_string, 1)
+        # Reuse the content already read above rather than re-reading from disk.
+        self._undo.snapshot("file_edit", str(path),
+                            existed_before=True, content_before=content)
+        try:
+            path.write_text(updated, encoding="utf-8")
+        except OSError as e:
+            return ToolResult(success=False, output="", error=str(e))
+
+        removed = old_string.count("\n") + 1
+        added = new_string.count("\n") + 1
+        return ToolResult(
+            success=True,
+            output=f"Edited {path}: replaced {removed} line(s) with {added} line(s).",
         )

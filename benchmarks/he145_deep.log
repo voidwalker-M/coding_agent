@@ -1,0 +1,13 @@
+20:59:13 WARNING llm.openai_compat — Empty response (finish_reason=length, no content or tool_call); resampling (attempt 1/2)
+
+🧪 HumanEval — openai/gpt-oss-120b
+   problems=1  attempts=1  engine=native  retriever=none
+
+  [FAIL] humaneval_145_order_by_points      status=success    steps=11 tokens= 56628 192.6s — ============================== 1 failed in 0.02s ===============================
+
+TASK                     RESULT   AGENT      STEPS   TOKENS   COST$    TIME
+--------------------------------------------------------------------------------
+humaneval_145_order_by_p FAIL     success       11    56628   0.566  192.6s
+--------------------------------------------------------------------------------
+Success rate: 0/1 = 0%   avg_steps=11.0  avg_tokens=56628  total_cost=$0.566  total_time=192.6s
+

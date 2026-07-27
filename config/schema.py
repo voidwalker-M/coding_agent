@@ -65,11 +65,21 @@ class ContextConfig:
 
 
 @dataclass
+class MemoryConfig:
+    enabled: bool = False
+    dir: str = ""                 # empty → <repo>/.agent_memory (resolved by the CLI)
+    top_k: int = 4                # long-term records recalled per task
+    max_records: int = 500        # cap before consolidation evicts the weakest
+    capture_episodes: bool = True # store an episodic memory at end of each run
+
+
+@dataclass
 class AppConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     agent: AgentCfg = field(default_factory=AgentCfg)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +134,7 @@ def _parse(data: dict[str, Any]) -> AppConfig:
     agent_raw = data.get("agent", {})
     tools_raw = data.get("tools", {})
     context_raw = data.get("context", {})
+    memory_raw = data.get("memory", {})
 
     llm = LLMConfig(
         provider=llm_raw.get("provider", "anthropic"),
@@ -156,7 +167,15 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         history_window=int(context_raw.get("history_window", 20)),
     )
 
-    return AppConfig(llm=llm, agent=agent, tools=tools, context=context)
+    memory = MemoryConfig(
+        enabled=bool(memory_raw.get("enabled", False)),
+        dir=memory_raw.get("dir", "") or "",
+        top_k=int(memory_raw.get("top_k", 4)),
+        max_records=int(memory_raw.get("max_records", 500)),
+        capture_episodes=bool(memory_raw.get("capture_episodes", True)),
+    )
+
+    return AppConfig(llm=llm, agent=agent, tools=tools, context=context, memory=memory)
 
 
 def merge_cli_overrides(

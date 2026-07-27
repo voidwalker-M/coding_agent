@@ -53,16 +53,21 @@ class EventLog:
     # ------------------------------------------------------------------
 
     @classmethod
-    def create(cls, task: Task, log_dir: str = "./logs") -> "EventLog":
+    def create(cls, task: Task, log_dir: str = "./logs",
+               timestamp: str | None = None) -> "EventLog":
         """
         Create an EventLog for a new run.
         The directory is created automatically if it does not exist.
+
+        `timestamp` lets the caller pin the filename stem so a run's other
+        artifacts (undo sidecar, text log) can share the identical
+        {task_id}_{timestamp} prefix. Generated from the clock when omitted.
         """
         log_path = Path(log_dir)
         log_path.mkdir(parents=True, exist_ok=True)
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        filename = f"{task.task_id}_{timestamp}.jsonl"
+        ts = timestamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        filename = f"{task.task_id}_{ts}.jsonl"
         return cls(log_path / filename)
 
     @classmethod
@@ -82,8 +87,10 @@ class EventLog:
             payload={"task": task.to_dict()},
         ))
 
-    def log_action(self, step: int, action: Action, raw_content: str = "") -> None:
-        """Each decision step of the agent. raw_content is the full raw text from the model."""
+    def log_action(self, step: int, action: Action, raw_content: str = "",
+                   duration_ms: float | None = None) -> None:
+        """Each decision step of the agent. raw_content is the full raw text from the model.
+        duration_ms is the LLM call latency; None when not measured."""
         self._append(Event(
             event_type=EventType.ACTION,
             task_id=self._current_task_id,
@@ -91,17 +98,20 @@ class EventLog:
                 "step":        step,
                 "action":      action.to_dict(),
                 "raw_content": raw_content,  # raw model output including the full reasoning chain
+                "duration_ms": duration_ms,
             },
         ))
 
-    def log_observation(self, step: int, observation: Observation) -> None:
-        """Tool execution result."""
+    def log_observation(self, step: int, observation: Observation,
+                        duration_ms: float | None = None) -> None:
+        """Tool execution result. duration_ms is the tool latency; None when not measured."""
         self._append(Event(
             event_type=EventType.OBSERVATION,
             task_id=self._current_task_id,
             payload={
                 "step":        step,
                 "observation": observation.to_dict(),
+                "duration_ms": duration_ms,
             },
         ))
 
@@ -273,6 +283,9 @@ def summarize_run(log: EventLog) -> dict:
         "actions":         0,
         "reflections":     0,
         "tool_calls":      {},   # tool_name -> count
+        "tool_time_by_name": {}, # tool_name -> total seconds
+        "llm_time_total":  0.0,
+        "tool_time_total": 0.0,
         "observations_ok": 0,
         "observations_err": 0,
         "final_status":    None,
@@ -285,6 +298,10 @@ def summarize_run(log: EventLog) -> dict:
             if tc:
                 name = tc["name"]
                 stats["tool_calls"][name] = stats["tool_calls"].get(name, 0) + 1
+            # .get(): logs written before timing instrumentation have no duration.
+            dur = event.payload.get("duration_ms")
+            if dur is not None:
+                stats["llm_time_total"] += dur / 1000.0
 
         elif event.event_type == EventType.OBSERVATION:
             obs = event.payload["observation"]
@@ -292,6 +309,14 @@ def summarize_run(log: EventLog) -> dict:
                 stats["observations_ok"] += 1
             else:
                 stats["observations_err"] += 1
+            dur = event.payload.get("duration_ms")
+            if dur is not None:
+                secs = dur / 1000.0
+                stats["tool_time_total"] += secs
+                name = obs.get("tool_name", "unknown")
+                stats["tool_time_by_name"][name] = (
+                    stats["tool_time_by_name"].get(name, 0.0) + secs
+                )
 
         elif event.event_type == EventType.REFLECTION:
             stats["reflections"] += 1

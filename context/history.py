@@ -17,6 +17,8 @@ Design:
 
 from __future__ import annotations
 
+from typing import Callable
+
 from llm.base import LLMMessage
 
 
@@ -31,14 +33,33 @@ class ConversationHistory:
         msgs = history.to_list()   # pass to LLMBackend
     """
 
-    def __init__(self, max_messages: int = 40) -> None:
+    def __init__(
+        self,
+        max_messages: int = 40,
+        on_evict: "Callable[[dict], None] | None" = None,
+    ) -> None:
         """
         Args:
             max_messages: maximum number of messages to retain (including the first task description).
                           The actual token count sent to the LLM is further trimmed by TokenBudget.
+            on_evict:     optional callback invoked with {"role", "content"} for each
+                          message the window drops. ShortTermMemory uses it to fold the
+                          evicted turn into a rolling summary so nothing is silently lost.
         """
         self._messages: list[LLMMessage] = []
         self._max = max_messages
+        self._on_evict = on_evict
+
+    def set_evict_callback(self, on_evict: "Callable[[dict], None] | None") -> None:
+        """Attach (or clear) the eviction callback after construction.
+
+        Chat mode builds the shared history itself, so the agent attaches the
+        short-term-memory fold hook here rather than at construction.
+        """
+        self._on_evict = on_evict
+
+    def has_evict_callback(self) -> bool:
+        return self._on_evict is not None
 
     def add(self, message: LLMMessage) -> None:
         """Add one message; discard the oldest non-first message if the window is exceeded."""
@@ -83,7 +104,9 @@ class ConversationHistory:
         while len(self._messages) > self._max:
             # Preserve index 0 (task description); discard from index 1 onward
             if len(self._messages) > 1:
-                self._messages.pop(1)
+                evicted = self._messages.pop(1)
+                if self._on_evict is not None:
+                    self._on_evict({"role": evicted.role, "content": evicted.content})
             else:
                 break
 

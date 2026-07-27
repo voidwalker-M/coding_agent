@@ -20,3 +20,10 @@ tools:
 context:
   repo_map_budget: 8000 # max tokens for repo-map
   history_window: 20 # number of most recent conversation rounds to retain
+
+memory:
+  enabled: false # persistent long-term memory across runs (--memory to enable on the CLI)
+  dir: "" # empty → <repo>/.agent_memory ; markdown files + MEMORY.md index live here
+  top_k: 4 # number of long-term memories recalled and injected per task
+  max_records: 500 # cap before consolidation evicts the weakest (recency/importance decayed)
+  capture_episodes: true # store an episodic memory (task→outcome) at end of each run

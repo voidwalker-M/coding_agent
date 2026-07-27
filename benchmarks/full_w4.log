@@ -1,0 +1,117 @@
+17:11:24 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:12:37 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:12:38 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 2/2)
+17:12:54 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:12:56 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:13:29 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:13:56 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:14:09 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:14:35 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:14:35 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 2/2)
+17:15:03 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:16:44 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:18:00 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:22:46 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:22:46 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 2/2)
+17:23:15 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:23:15 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 2/2)
+17:23:58 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:23:59 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 2/2)
+17:24:20 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:24:20 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 2/2)
+17:24:54 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 1/2)
+17:24:54 WARNING llm.openai_compat — Empty response (finish_reason=stop, no content or tool_call); resampling (attempt 2/2)
+
+🧪 HumanEval — openai/gpt-oss-120b
+   problems=41  attempts=1  engine=native  retriever=none
+
+  [PASS] humaneval_123_get_odd_collatz      status=success    steps= 6 tokens= 17261  16.0s — ============================== 1 passed in 0.01s ===============================
+  [PASS] humaneval_124_valid_date           status=success    steps= 5 tokens= 15500  19.7s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_125_split_words          status=success    steps= 6 tokens= 16849  22.7s — ============================== 1 passed in 0.01s ===============================
+  [PASS] humaneval_126_is_sorted            status=success    steps= 5 tokens= 13660  12.7s — ============================== 1 passed in 0.01s ===============================
+  [FAIL] humaneval_127_intersection         status=gave_up    steps= 1 tokens=  1979   2.7s — ============================== 1 failed in 0.02s ===============================
+  [PASS] humaneval_128_prod_signs           status=success    steps= 5 tokens= 13491  13.7s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_129_minPath              status=success    steps= 5 tokens= 18999  34.6s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_130_tri                  status=success    steps= 6 tokens= 19751  26.1s — ============================== 1 passed in 0.12s ===============================
+  [PASS] humaneval_131_digits               status=success    steps= 6 tokens= 15334  12.7s — ============================== 1 passed in 0.01s ===============================
+  [PASS] humaneval_132_is_nested            status=success    steps= 6 tokens= 17660  24.8s — ============================== 1 passed in 0.01s ===============================
+  [PASS] humaneval_133_sum_squares          status=success    steps= 5 tokens= 13822  11.8s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_134_check_if_last_char_is_a_letter status=success    steps= 7 tokens= 18842  15.8s — ============================== 1 passed in 0.01s ===============================
+  [PASS] humaneval_135_can_arrange          status=success    steps= 5 tokens= 12339  11.6s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_136_largest_smallest_integers status=success    steps= 6 tokens= 16613  12.0s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_137_compare_one          status=success    steps= 6 tokens= 16635  14.9s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_138_is_equal_to_sum_even status=success    steps= 5 tokens= 12148  11.6s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_139_special_factorial    status=success    steps= 6 tokens= 15363   9.6s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_140_fix_spaces           status=success    steps= 4 tokens=  9786  12.2s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_141_file_name_check      status=success    steps= 7 tokens= 23124  24.8s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_142_sum_squares          status=success    steps= 5 tokens= 14818  27.3s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_143_words_in_sentence    status=success    steps= 6 tokens= 16623  14.5s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_144_simplify             status=max_steps  steps=12 tokens= 38602  33.5s — ============================== 1 passed in 0.02s ===============================
+  [FAIL] humaneval_145_order_by_points      status=max_steps  steps=12 tokens= 60725 271.5s — ============================== 1 failed in 0.02s ===============================
+  [PASS] humaneval_146_specialFilter        status=success    steps= 4 tokens= 10249  12.8s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_147_get_max_triples      status=success    steps= 7 tokens= 21023  28.6s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_148_bf                   status=success    steps= 5 tokens= 15035  13.5s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_149_sorted_list_sum      status=success    steps= 5 tokens= 13743  10.0s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_150_x_or_y               status=success    steps= 5 tokens= 12919   7.1s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_151_double_the_difference status=success    steps= 5 tokens= 14019  11.1s — ============================== 1 passed in 0.02s ===============================
+  [FAIL] humaneval_152_compare              status=gave_up    steps= 1 tokens=  1979   1.7s — ============================== 1 failed in 0.03s ===============================
+  [PASS] humaneval_153_Strongest_Extension  status=success    steps= 6 tokens= 18976  18.2s — ============================== 1 passed in 0.02s ===============================
+  [FAIL] humaneval_154_cycpattern_check     status=gave_up    steps= 1 tokens=  2005   2.0s — ============================== 1 failed in 0.03s ===============================
+  [PASS] humaneval_155_even_odd_count       status=success    steps= 5 tokens= 12381   5.0s — ============================== 1 passed in 0.03s ===============================
+  [PASS] humaneval_156_int_to_mini_roman    status=success    steps= 6 tokens= 16690   7.9s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_157_right_angle_triangle status=success    steps= 6 tokens= 16346   7.9s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_158_find_max             status=success    steps= 5 tokens= 13851   8.5s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_159_eat                  status=success    steps= 6 tokens= 17941  11.3s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_160_do_algebra           status=success    steps= 5 tokens= 14023   9.4s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_161_solve                status=success    steps= 4 tokens=  9610   6.0s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_162_string_to_md5        status=success    steps= 5 tokens= 12130   5.4s — ============================== 1 passed in 0.03s ===============================
+  [PASS] humaneval_163_generate_integers    status=success    steps= 5 tokens= 12659   8.8s — ============================== 1 passed in 0.02s ===============================
+
+TASK                     RESULT   AGENT      STEPS   TOKENS   COST$    TIME
+--------------------------------------------------------------------------------
+humaneval_123_get_odd_co PASS     success        6    17261   0.173   16.0s
+humaneval_124_valid_date PASS     success        5    15500   0.155   19.7s
+humaneval_125_split_word PASS     success        6    16849   0.168   22.7s
+humaneval_126_is_sorted  PASS     success        5    13660   0.137   12.7s
+humaneval_127_intersecti FAIL     gave_up        1     1979   0.020    2.7s
+humaneval_128_prod_signs PASS     success        5    13491   0.135   13.7s
+humaneval_129_minPath    PASS     success        5    18999   0.190   34.6s
+humaneval_130_tri        PASS     success        6    19751   0.198   26.1s
+humaneval_131_digits     PASS     success        6    15334   0.153   12.7s
+humaneval_132_is_nested  PASS     success        6    17660   0.177   24.8s
+humaneval_133_sum_square PASS     success        5    13822   0.138   11.8s
+humaneval_134_check_if_l PASS     success        7    18842   0.188   15.8s
+humaneval_135_can_arrang PASS     success        5    12339   0.123   11.6s
+humaneval_136_largest_sm PASS     success        6    16613   0.166   12.0s
+humaneval_137_compare_on PASS     success        6    16635   0.166   14.9s
+humaneval_138_is_equal_t PASS     success        5    12148   0.121   11.6s
+humaneval_139_special_fa PASS     success        6    15363   0.154    9.6s
+humaneval_140_fix_spaces PASS     success        4     9786   0.098   12.2s
+humaneval_141_file_name_ PASS     success        7    23124   0.231   24.8s
+humaneval_142_sum_square PASS     success        5    14818   0.148   27.3s
+humaneval_143_words_in_s PASS     success        6    16623   0.166   14.5s
+humaneval_144_simplify   PASS     max_steps     12    38602   0.386   33.5s
+humaneval_145_order_by_p FAIL     max_steps     12    60725   0.607  271.5s
+humaneval_146_specialFil PASS     success        4    10249   0.102   12.8s
+humaneval_147_get_max_tr PASS     success        7    21023   0.210   28.6s
+humaneval_148_bf         PASS     success        5    15035   0.150   13.5s
+humaneval_149_sorted_lis PASS     success        5    13743   0.137   10.0s
+humaneval_150_x_or_y     PASS     success        5    12919   0.129    7.1s
+humaneval_151_double_the PASS     success        5    14019   0.140   11.1s
+humaneval_152_compare    FAIL     gave_up        1     1979   0.020    1.7s
+humaneval_153_Strongest_ PASS     success        6    18976   0.190   18.2s
+humaneval_154_cycpattern FAIL     gave_up        1     2005   0.020    2.0s
+humaneval_155_even_odd_c PASS     success        5    12381   0.124    5.0s
+humaneval_156_int_to_min PASS     success        6    16690   0.167    7.9s
+humaneval_157_right_angl PASS     success        6    16346   0.163    7.9s
+humaneval_158_find_max   PASS     success        5    13851   0.139    8.5s
+humaneval_159_eat        PASS     success        6    17941   0.179   11.3s
+humaneval_160_do_algebra PASS     success        5    14023   0.140    9.4s
+humaneval_161_solve      PASS     success        4     9610   0.096    6.0s
+humaneval_162_string_to_ PASS     success        5    12130   0.121    5.4s
+humaneval_163_generate_i PASS     success        5    12659   0.127    8.8s
+--------------------------------------------------------------------------------
+Success rate: 37/41 = 90%   avg_steps=5.4  avg_tokens=15988  total_cost=$6.555  total_time=832.2s
+
+  Report saved to benchmarks/full_w4.json
+
