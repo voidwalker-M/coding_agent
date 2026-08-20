@@ -1,0 +1,19 @@
+{
+  "summary": {
+    "benchmark": "SWE-bench Lite",
+    "model": "gpt-oss-120b",
+    "grading": "local (no Docker)",
+    "generated": "2026-07-18",
+    "total_instances": 0,
+    "skipped_ungradable": 0,
+    "gradable_instances": 0,
+    "resolved": 0,
+    "unresolved": 0,
+    "resolve_rate": null,
+    "resolve_rate_pct": "N/A",
+    "resolve_rate_note": "0 resolved / 0 gradable. Rate is undefined because the denominator is 0 (no gradable instances were provided).",
+    "failure_taxonomy": {}
+  },
+  "per_repo": {},
+  "results": []
+}

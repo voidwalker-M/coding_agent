@@ -49,6 +49,13 @@ class TaskSpec:
     setup_files: dict[str, str] = field(default_factory=dict)  # relpath -> content
     setup_dir: str | None = None                       # alternatively: copy an existing fixture directory
     max_steps: int = 20
+    # Custom repo preparation. When set, the harness calls setup_hook(repo_path)
+    # to populate the (freshly created, empty) task repo instead of laying down
+    # setup_files/setup_dir + running git init. Used by SWE-bench, which must
+    # `git clone` a real repository and check it out at a specific base commit;
+    # the hook is responsible for leaving a usable git state (that checkout is
+    # the baseline the agent's `git diff` is measured against).
+    setup_hook: Callable[[Path], None] | None = None
 
 
 @dataclass
@@ -73,6 +80,8 @@ class EvalResult:
     attempts: int = 1
     num_passed: int = 0         # how many of `attempts` passed
     cost_usd: float = 0.0       # estimated $ cost (blended; 0 if tokens unknown)
+    llm_time: float = 0.0       # seconds in LLM calls, summed across attempts
+    tool_time: float = 0.0      # seconds executing tools, summed across attempts
 
     def to_dict(self) -> dict:
         return {
@@ -86,6 +95,8 @@ class EvalResult:
             "tokens": self.tokens,
             "cost_usd": round(self.cost_usd, 4),
             "elapsed": round(self.elapsed, 2),
+            "llm_time": round(self.llm_time, 2),
+            "tool_time": round(self.tool_time, 2),
             "detail": self.detail,
             "error": self.error,
         }
@@ -141,6 +152,14 @@ class EvalReport:
     def total_time(self) -> float:
         return sum(r.elapsed for r in self.results)
 
+    @property
+    def total_llm_time(self) -> float:
+        return sum(r.llm_time for r in self.results)
+
+    @property
+    def total_tool_time(self) -> float:
+        return sum(r.tool_time for r in self.results)
+
     def to_dict(self) -> dict:
         return {
             "summary": {
@@ -154,6 +173,8 @@ class EvalReport:
                 "total_cost_usd": round(self.total_cost, 4),
                 "avg_cost_usd": round(self.avg_cost, 4),
                 "total_time": round(self.total_time, 2),
+                "total_llm_time": round(self.total_llm_time, 2),
+                "total_tool_time": round(self.total_tool_time, 2),
             },
             "results": [r.to_dict() for r in self.results],
         }
@@ -181,6 +202,10 @@ class EvalReport:
             f"Success rate: {self.passed}/{self.total} = {self.success_rate:.0%}   "
             f"avg_steps={self.avg_steps:.1f}  avg_tokens={self.avg_tokens:.0f}  "
             f"total_cost=${self.total_cost:.3f}  total_time={self.total_time:.1f}s"
+        )
+        rows.append(
+            f"Time split: llm={self.total_llm_time:.1f}s  tool={self.total_tool_time:.1f}s  "
+            f"other={max(0.0, self.total_time - self.total_llm_time - self.total_tool_time):.1f}s"
         )
         if self.multi_attempt:
             rows.append(
@@ -253,6 +278,7 @@ class EvalHarness:
         passes: list[bool] = []
         tot_steps = tot_tokens = 0
         tot_elapsed = 0.0
+        tot_llm_time = tot_tool_time = 0.0
         # Representative metadata: the first PASSING attempt if any, else the first attempt.
         rep_status = "crashed"
         rep_detail = ""
@@ -260,7 +286,21 @@ class EvalHarness:
         rep_locked = False   # True once we've recorded a passing attempt's metadata
 
         for attempt_i in range(attempts):
-            self._prepare_repo(spec, repo_path)
+            # Repo preparation can fail for reasons unrelated to the agent (a clone
+            # or checkout that times out, a missing commit). Record it as a failed
+            # attempt instead of letting it abort the whole suite — a long sweep
+            # must not lose every other result to one bad instance.
+            try:
+                self._prepare_repo(spec, repo_path)
+            except Exception as exc:
+                logger.exception("Repo preparation failed for task %s", spec.id)
+                passes.append(False)
+                if attempt_i == 0:
+                    rep_status = "setup_failed"
+                    rep_detail = f"SETUP_ERROR: {exc}"
+                    rep_error = str(exc)
+                continue
+
             agent = self._factory(spec, str(repo_path))
             task = Task(description=spec.description, repo_path=str(repo_path),
                         max_steps=spec.max_steps)
@@ -290,6 +330,8 @@ class EvalHarness:
             passes.append(a_passed)
             tot_steps += (run_result.steps_taken if run_result else 0)
             tot_tokens += (run_result.total_tokens if run_result else 0)
+            tot_llm_time += (run_result.llm_time if run_result else 0.0)
+            tot_tool_time += (run_result.tool_time if run_result else 0.0)
             a_status = run_result.status.value if run_result else "crashed"
             a_error = run_error or (run_result.error if run_result else None)
 
@@ -313,6 +355,8 @@ class EvalHarness:
             attempts=attempts,
             num_passed=sum(passes),
             cost_usd=estimate_cost(self._model_name, tot_tokens),
+            llm_time=tot_llm_time,
+            tool_time=tot_tool_time,
         )
 
         if not self._keep:
@@ -330,6 +374,13 @@ class EvalHarness:
         if repo_path.exists():
             shutil.rmtree(repo_path, ignore_errors=True)
         repo_path.mkdir(parents=True, exist_ok=True)
+
+        if spec.setup_hook is not None:
+            # The hook fully populates the repo (e.g. clone + checkout at a base
+            # commit) and leaves its own git state as the baseline; do not lay
+            # down setup_files or re-run git init on top of it.
+            spec.setup_hook(repo_path)
+            return
 
         if spec.setup_dir:
             src = Path(spec.setup_dir)

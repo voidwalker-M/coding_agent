@@ -1,0 +1,52 @@
+
+🧪 HumanEval — openai/gpt-oss-120b
+   problems=20  attempts=1  engine=native  retriever=none
+
+  [PASS] humaneval_0_has_close_elements     status=success    steps= 5 tokens= 13707   6.8s — ============================== 1 passed in 0.01s ===============================
+  [PASS] humaneval_1_separate_paren_groups  status=success    steps= 5 tokens= 13412   5.8s — ============================== 1 passed in 0.01s ===============================
+  [PASS] humaneval_2_truncate_number        status=success    steps= 5 tokens= 12349   5.3s — ============================== 1 passed in 0.01s ===============================
+  [PASS] humaneval_3_below_zero             status=success    steps= 6 tokens= 14731   8.4s — ============================== 1 passed in 0.01s ===============================
+  [PASS] humaneval_4_mean_absolute_deviation status=success    steps= 5 tokens= 13222   4.1s — ============================== 1 passed in 0.01s ===============================
+  [PASS] humaneval_5_intersperse            status=success    steps= 5 tokens= 12395   3.6s — ============================== 1 passed in 0.13s ===============================
+  [FAIL] humaneval_6_parse_nested_parens    status=gave_up    steps= 2 tokens=  4291   1.1s — ============================== 1 failed in 0.03s ===============================
+  [PASS] humaneval_7_filter_by_substring    status=success    steps= 6 tokens= 15331   4.3s — ============================== 1 passed in 0.01s ===============================
+  [PASS] humaneval_8_sum_product            status=success    steps= 4 tokens=  9280   3.0s — ============================== 1 passed in 0.13s ===============================
+  [PASS] humaneval_9_rolling_max            status=success    steps= 5 tokens= 12895   7.8s — ============================== 1 passed in 0.01s ===============================
+  [FAIL] humaneval_10_make_palindrome       status=gave_up    steps= 2 tokens=  4275   0.9s — ============================== 1 failed in 0.03s ===============================
+  [PASS] humaneval_11_string_xor            status=success    steps= 6 tokens= 15224   4.9s — ============================== 1 passed in 0.01s ===============================
+  [PASS] humaneval_12_longest               status=success    steps= 5 tokens= 12442   3.7s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_13_greatest_common_divisor status=success    steps= 6 tokens= 15065   4.2s — ============================== 1 passed in 0.01s ===============================
+  [FAIL] humaneval_14_all_prefixes          status=gave_up    steps= 1 tokens=  1984   0.4s — ============================== 1 failed in 0.03s ===============================
+  [PASS] humaneval_15_string_sequence       status=success    steps= 5 tokens= 12416   4.2s — ============================== 1 passed in 0.02s ===============================
+  [PASS] humaneval_16_count_distinct_characters status=success    steps= 5 tokens= 12138   7.2s — ============================== 1 passed in 0.11s ===============================
+  [FAIL] humaneval_17_parse_music           status=gave_up    steps= 1 tokens=  1974   0.4s — ============================== 1 failed in 0.03s ===============================
+  [FAIL] humaneval_18_how_many_times        status=gave_up    steps= 1 tokens=  2007   0.5s — ============================== 1 failed in 0.03s ===============================
+  [FAIL] humaneval_19_sort_numbers          status=gave_up    steps= 1 tokens=  1979   1.1s — ============================== 1 failed in 0.03s ===============================
+
+TASK                     RESULT   AGENT      STEPS   TOKENS   COST$    TIME
+--------------------------------------------------------------------------------
+humaneval_0_has_close_el PASS     success        5    13707   0.137    6.8s
+humaneval_1_separate_par PASS     success        5    13412   0.134    5.8s
+humaneval_2_truncate_num PASS     success        5    12349   0.123    5.3s
+humaneval_3_below_zero   PASS     success        6    14731   0.147    8.4s
+humaneval_4_mean_absolut PASS     success        5    13222   0.132    4.1s
+humaneval_5_intersperse  PASS     success        5    12395   0.124    3.6s
+humaneval_6_parse_nested FAIL     gave_up        2     4291   0.043    1.1s
+humaneval_7_filter_by_su PASS     success        6    15331   0.153    4.3s
+humaneval_8_sum_product  PASS     success        4     9280   0.093    3.0s
+humaneval_9_rolling_max  PASS     success        5    12895   0.129    7.8s
+humaneval_10_make_palind FAIL     gave_up        2     4275   0.043    0.9s
+humaneval_11_string_xor  PASS     success        6    15224   0.152    4.9s
+humaneval_12_longest     PASS     success        5    12442   0.124    3.7s
+humaneval_13_greatest_co PASS     success        6    15065   0.151    4.2s
+humaneval_14_all_prefixe FAIL     gave_up        1     1984   0.020    0.4s
+humaneval_15_string_sequ PASS     success        5    12416   0.124    4.2s
+humaneval_16_count_disti PASS     success        5    12138   0.121    7.2s
+humaneval_17_parse_music FAIL     gave_up        1     1974   0.020    0.4s
+humaneval_18_how_many_ti FAIL     gave_up        1     2007   0.020    0.5s
+humaneval_19_sort_number FAIL     gave_up        1     1979   0.020    1.1s
+--------------------------------------------------------------------------------
+Success rate: 14/20 = 70%   avg_steps=4.0  avg_tokens=10056  total_cost=$2.011  total_time=77.6s
+
+  Report saved to benchmarks/humaneval_report.json
+

@@ -55,6 +55,14 @@ class LLMResponse:
     raw_content: str                    # raw text output from the LLM, for debugging
     input_tokens: int = 0
     output_tokens: int = 0
+    # Optional confidence signal in [0, 1] used by the confidence/uncertainty
+    # router (llm/model_router.py). None means "unknown" — a backend that can
+    # measure it (self-report, logprobs) sets it; otherwise the router falls
+    # back to a heuristic derived from the parsed Action.
+    confidence: float | None = None
+    # Mean per-token logprob of the sampled answer when the provider returns it
+    # (diagnostic; also feeds the confidence estimate). None when unavailable.
+    logprob_avg: float | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -154,14 +162,24 @@ class MockBackend(LLMBackend):
         script: list[Action],
         input_tokens: int = 100,
         output_tokens: int = 50,
+        confidence: "float | list[float] | None" = None,
     ) -> None:
         self._script = script
         self._index = 0
         self._input_tokens = input_tokens
         self._output_tokens = output_tokens
+        # Optional confidence attached to each response so cascade/confidence
+        # routing can be exercised deterministically. A scalar applies to every
+        # response; a list is consumed per-call (cycling if shorter than script).
+        self._confidence = confidence
         # Record all complete() calls for test assertions
         self.call_count = 0
         self.received_messages: list[list[LLMMessage]] = []
+
+    def _next_confidence(self, i: int) -> "float | None":
+        if isinstance(self._confidence, (list, tuple)):
+            return self._confidence[i % len(self._confidence)] if self._confidence else None
+        return self._confidence
 
     @property
     def model_name(self) -> str:
@@ -177,6 +195,7 @@ class MockBackend(LLMBackend):
 
         if self._index < len(self._script):
             action = self._script[self._index]
+            conf = self._next_confidence(self._index)
             self._index += 1
         else:
             # Script exhausted; return GIVE_UP to prevent an infinite loop in core.py
@@ -185,12 +204,14 @@ class MockBackend(LLMBackend):
                 thought="MockBackend script exhausted.",
                 message="No more scripted actions.",
             )
+            conf = None
 
         return LLMResponse(
             action=action,
             raw_content=f"[mock] {action!r}",
             input_tokens=self._input_tokens,
             output_tokens=self._output_tokens,
+            confidence=conf,
         )
 
     def reset(self) -> None:

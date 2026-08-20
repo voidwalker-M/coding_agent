@@ -49,6 +49,8 @@ class OpenAICompatBackend(LLMBackend):
         api_key: str,
         base_url: str | None = None,
         max_tokens: int = 4096,
+        max_empty_retries: int = 2,
+        request_logprobs: bool = False,
     ) -> None:
         try:
             from openai import OpenAI
@@ -58,9 +60,24 @@ class OpenAICompatBackend(LLMBackend):
 
         self._model = model
         self._max_tokens = max_tokens
+        # Reasoning models (e.g. gpt-oss-120b) intermittently end their turn after
+        # the analysis/reasoning channel without emitting any content or tool call
+        # — a non-deterministic empty response. Observed empirically to happen on
+        # a large fraction of turns via the LiteLLM/UF proxy, so a low retry count
+        # lets a single unlucky turn abort an otherwise-solvable task (agent
+        # gives up mid-run). A resample almost always returns a proper action, so
+        # we retry generously before surfacing a give-up.
+        self._max_empty_retries = max_empty_retries
         self._use_function_calling = not any(
             model.lower().startswith(prefix) for prefix in _NO_FUNCTION_CALLING
         )
+        # Opt-in: ask the provider for token logprobs so the confidence/uncertainty
+        # router (llm/model_router.py) can use a real signal instead of a heuristic.
+        # Off by default because not every OpenAI-compatible proxy supports it.
+        self._request_logprobs = request_logprobs
+
+    def _logprob_kwargs(self) -> dict:
+        return {"logprobs": True} if self._request_logprobs else {}
 
     @property
     def model_name(self) -> str:
@@ -100,13 +117,25 @@ class OpenAICompatBackend(LLMBackend):
     ) -> LLMResponse:
         api_tools = [_to_openai_tool(t) for t in tools]
 
-        response = self._client.chat.completions.create(
-            model=self._model,
-            max_tokens=self._max_tokens,
-            messages=api_messages,
-            tools=api_tools,
-            tool_choice="auto",
-        )
+        response = None
+        for attempt in range(self._max_empty_retries + 1):
+            response = self._client.chat.completions.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                messages=api_messages,
+                tools=api_tools,
+                tool_choice="auto",
+                **self._logprob_kwargs(),
+            )
+            if not _is_empty_response(response.choices[0]):
+                break
+            if attempt < self._max_empty_retries:
+                logger.warning(
+                    "Empty response (finish_reason=%s, no content or tool_call); "
+                    "resampling (attempt %d/%d)",
+                    response.choices[0].finish_reason,
+                    attempt + 1, self._max_empty_retries,
+                )
 
         choice = response.choices[0]
         message = choice.message
@@ -126,6 +155,7 @@ class OpenAICompatBackend(LLMBackend):
             raw_content=thought,
             input_tokens=response.usage.prompt_tokens,
             output_tokens=response.usage.completion_tokens,
+            logprob_avg=_mean_logprob(choice),
         )
 
     # ------------------------------------------------------------------
@@ -147,11 +177,22 @@ class OpenAICompatBackend(LLMBackend):
                 "content": augmented[0]["content"] + "\n\n" + tool_desc,
             }
 
-        response = self._client.chat.completions.create(
-            model=self._model,
-            max_tokens=self._max_tokens,
-            messages=augmented,
-        )
+        response = None
+        for attempt in range(self._max_empty_retries + 1):
+            response = self._client.chat.completions.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                messages=augmented,
+                **self._logprob_kwargs(),
+            )
+            if (response.choices[0].message.content or "").strip():
+                break
+            if attempt < self._max_empty_retries:
+                logger.warning(
+                    "Empty text response (finish_reason=%s); resampling (attempt %d/%d)",
+                    response.choices[0].finish_reason,
+                    attempt + 1, self._max_empty_retries,
+                )
 
         choice = response.choices[0]
         raw_text = choice.message.content or ""
@@ -163,6 +204,7 @@ class OpenAICompatBackend(LLMBackend):
             raw_content=raw_text,
             input_tokens=response.usage.prompt_tokens,
             output_tokens=response.usage.completion_tokens,
+            logprob_avg=_mean_logprob(choice),
         )
 
 
@@ -195,6 +237,37 @@ def _to_openai_tool(schema: LLMToolSchema) -> dict:
             "parameters": schema.parameters,
         },
     }
+
+
+def _mean_logprob(choice: Any) -> float | None:
+    """Mean per-token logprob of the sampled answer, or None if unavailable.
+
+    Fully defensive: providers that don't return logprobs (or return them in a
+    different shape) simply yield None, and the confidence router falls back to
+    its heuristic. Never raises.
+    """
+    try:
+        content = choice.logprobs.content            # list of per-token entries
+        vals = [tok.logprob for tok in content if getattr(tok, "logprob", None) is not None]
+        if not vals:
+            return None
+        return sum(vals) / len(vals)
+    except (AttributeError, TypeError, ZeroDivisionError):
+        return None
+
+
+def _is_empty_response(choice: Any) -> bool:
+    """True when the model ended its turn with neither content nor a tool call.
+
+    Reasoning models (gpt-oss and similar) intermittently stop after the
+    reasoning/analysis channel without transitioning to a final answer or a tool
+    call, yielding an empty response. This is non-deterministic, so the caller
+    resamples instead of treating it as a genuine give-up.
+    """
+    message = choice.message
+    has_content = bool((getattr(message, "content", None) or "").strip())
+    has_tool_calls = bool(getattr(message, "tool_calls", None))
+    return not has_content and not has_tool_calls
 
 
 def _parse_openai_response(choice: Any, thought: str) -> Action:

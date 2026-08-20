@@ -218,6 +218,8 @@ class RunResult:
     total_tokens: int = 0
     patch: str | None = None            # changes in git-diff format
     error: str | None = None            # reason when status == FAILED
+    llm_time: float = 0.0               # total seconds spent in LLM calls (including retries)
+    tool_time: float = 0.0              # total seconds spent executing tools
 
     def is_success(self) -> bool:
         return self.status == RunStatus.SUCCESS

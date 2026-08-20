@@ -62,30 +62,109 @@ def magenta(t: str) -> str: return _c(t, "35")
 # Build agent components
 # ---------------------------------------------------------------------------
 
-def _build_registry(cfg, confirm_callback=None, runtime=None):
-    """Assemble the tool registry from configuration."""
+def _setup_logging(verbose: bool, log_file: "Path | None" = None,
+                   verbose_level: int = logging.DEBUG) -> None:
+    """Configure root logging: stderr always, plus a file handler when given.
+
+    force=True so repeated in-process invocations (Click's CliRunner in tests)
+    reconfigure instead of silently keeping the first call's handlers.
+    """
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    logging.basicConfig(
+        level=verbose_level if verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)-7s %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=handlers,
+        force=True,
+    )
+
+
+def _build_registry(cfg, confirm_callback=None, runtime=None, memory=None, symbol_index=None,
+                    undo_manager=None):
+    """Assemble the tool registry from configuration.
+
+    memory:       a LongTermMemory instance; when given, the remember/recall tools
+                  are registered so the agent can manage its own persistent memory.
+    symbol_index: a prebuilt SymbolIndex; when given, find_symbol answers from it
+                  (O(1) indexed lookup) instead of re-scanning the repo per call.
+    undo_manager: shared UndoManager backing file snapshots and the undo tool.
+                  Defaults to an in-memory-only one (no sidecar file on disk).
+    """
     from tools.base import ToolRegistry
-    from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool
+    from tools.file_tool import FileEditTool, FileReadTool, FileViewTool, FileWriteTool
     from tools.git_tool import GitAddTool, GitCommitTool, GitDiffTool, GitStatusTool
     from tools.search_tool import FindFilesTool, FindSymbolTool, SearchTextTool
     from tools.shell_tool import ShellTool
     from tools.test_tool import PytestTool
+    from tools.undo_tool import UndoManager, UndoTool
 
-    return (
+    if undo_manager is None:
+        undo_manager = UndoManager()
+
+    registry = (
         ToolRegistry()
         .register(ShellTool(confirm_callback=confirm_callback, runtime=runtime))
         .register(FileReadTool())
         .register(FileViewTool())
-        .register(FileWriteTool())
+        .register(FileWriteTool(undo_manager=undo_manager))
+        .register(FileEditTool(undo_manager=undo_manager))
+        .register(UndoTool(undo_manager))
         .register(SearchTextTool())
         .register(FindFilesTool())
-        .register(FindSymbolTool())
+        .register(FindSymbolTool(index=symbol_index))
         .register(PytestTool(runtime=runtime))
         .register(GitStatusTool(runtime=runtime))
         .register(GitDiffTool(runtime=runtime))
         .register(GitAddTool(runtime=runtime))
         .register(GitCommitTool(runtime=runtime))
     )
+    if memory is not None:
+        from tools.memory_tool import RecallTool, RememberTool
+        registry.register(RememberTool(memory)).register(RecallTool(memory))
+    return registry
+
+
+def _build_symbol_index(repo_path: str):
+    """Build a persistent, incremental SymbolIndex for the repo (best-effort).
+
+    Cached under <repo>/.symbol_cache so only changed files are re-parsed on
+    subsequent runs. Returns None on any failure (find_symbol then falls back to
+    its regex scan), so this never blocks a run.
+    """
+    from pathlib import Path as _Path
+    from context.symbol_index import SymbolIndex
+    try:
+        return SymbolIndex(repo_path, cache_dir=str(_Path(repo_path) / ".symbol_cache")).build()
+    except Exception:
+        return None
+
+
+def _build_memory(repo_path: str, cfg, *, enable: bool):
+    """Build a LongTermMemory when memory is enabled (config or --memory), else None.
+
+    Stores markdown records + a MEMORY.md index under `memory.dir` (default
+    <repo>/.agent_memory). Uses the RAG embedding backend for dense recall when
+    numpy is available; otherwise degrades to the built-in lexical engine.
+    """
+    if not enable:
+        return None
+    from pathlib import Path as _Path
+    from context.memory import LongTermMemory
+
+    mem_dir = cfg.memory.dir or str(_Path(repo_path) / ".agent_memory")
+    embeddings = None
+    try:                                    # optional dense recall (needs numpy)
+        import numpy  # noqa: F401
+        from context.rag import create_embedding_backend
+        embeddings = create_embedding_backend()
+    except Exception:
+        embeddings = None
+    return LongTermMemory(
+        mem_dir, embeddings=embeddings, max_records=cfg.memory.max_records
+    ).load()
 
 
 def _build_retriever(repo_path: str, kind: str, rerank: str = "none", cache: bool = True,
@@ -200,9 +279,14 @@ def cli(ctx: click.Context, config: str | None) -> None:
 @click.option("--retriever", "-R", type=click.Choice(["none", "rag"]), default="none", show_default=True, help="Context retriever: 'rag' enables hybrid (dense+BM25) code retrieval")
 @click.option("--rerank", type=click.Choice(["none", "mmr", "cross-encoder"]), default="none", show_default=True, help="Rerank retrieved chunks: 'mmr' (numpy, diversity) or 'cross-encoder' (needs sentence-transformers)")
 @click.option("--rag-extra", multiple=True, type=click.Path(), help="External dir/file to index with RAG (docs, dependency source). Repeatable. Implies --retriever rag")
+@click.option("--memory", is_flag=True, default=False, help="Enable persistent long-term memory (markdown store + recall/remember tools)")
+@click.option("--memory-dir", default=None, type=click.Path(), help="Directory for long-term memory (default: <repo>/.agent_memory)")
 @click.option("--engine", "-e", type=click.Choice(["native", "langgraph"]), default="native", show_default=True, help="Orchestration engine: 'langgraph' runs the LangGraph port")
 @click.option("--cache", is_flag=True, default=False, help="Cache LLM responses (saves tokens on repeated/identical calls)")
-@click.option("--cheap-model", default=None, help="Enable cost-aware routing: send easy steps to this cheaper model")
+@click.option("--cheap-model", default=None, help="Enable cost-aware routing: cheapest tier model")
+@click.option("--mid-model", default=None, help="Optional middle-tier model for 3-tier routing")
+@click.option("--router", type=click.Choice(["heuristic", "difficulty", "cascade"]), default="heuristic", show_default=True, help="Routing policy when a cheap/mid model is set: keyword heuristic, up-front difficulty estimate, or confidence cascade")
+@click.option("--min-confidence", default=0.35, show_default=True, type=float, help="Cascade router: escalate to a stronger model when confidence falls below this")
 @click.option("--max-usd", default=None, type=float, help="Hard spend ceiling in USD for this run (stops when exceeded)")
 @click.option("--rpm", default=None, type=int, help="Throttle LLM calls to at most this many requests per minute")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
@@ -221,20 +305,22 @@ def run(
     retriever: str,
     rerank: str,
     rag_extra: tuple,
+    memory: bool,
+    memory_dir: str | None,
     engine: str,
     cache: bool,
     cheap_model: str | None,
+    mid_model: str | None,
+    router: str,
+    min_confidence: float,
     max_usd: float | None,
     rpm: int | None,
     verbose: bool,
 ) -> None:
     """Run the coding agent on a repository."""
-    # Configure logging
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)-7s %(name)s — %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    from datetime import datetime, timezone
+
+    from agent.task import Task
 
     # Load configuration
     config = load_config(ctx.obj.get("config_path"))
@@ -255,6 +341,19 @@ def run(
     if not repo_path.exists():
         click.echo(red(f"Error: repo path does not exist: {repo_path}"), err=True)
         sys.exit(1)
+
+    # Build the task up front so this run's three artifacts — event log, undo
+    # sidecar, text log — all share one {task_id}_{timestamp} stem.
+    task_obj = Task(
+        description=description,
+        repo_path=str(repo_path),
+        max_steps=config.agent.max_steps,
+        budget_tokens=config.agent.budget_tokens,
+    )
+    run_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    log_dir_path = Path(config.agent.log_dir)
+    stem = f"{task_obj.task_id}_{run_ts}"
+    _setup_logging(verbose, log_dir_path / f"{stem}.log")
 
     # Print run info
     click.echo(bold(f"\n🤖 Coding Agent"))
@@ -277,22 +376,30 @@ def run(
         sys.exit(1)
 
     # Token-efficiency layers (#4): cost-aware routing, response cache, rate/$ limit.
-    if cache or cheap_model or max_usd is not None or rpm is not None:
+    if cache or cheap_model or mid_model or max_usd is not None or rpm is not None:
         from llm.compose import compose_backend
-        cheap_backend = None
-        if cheap_model:
-            cheap_backend = create_backend_from_config({
-                "provider": config.llm.provider, "model": cheap_model,
+
+        def _tier_backend(name: str):
+            return create_backend_from_config({
+                "provider": config.llm.provider, "model": name,
                 "api_key": config.llm.api_key or None, "base_url": config.llm.base_url or None,
                 "max_tokens": config.llm.max_tokens,
             })
+
+        cheap_backend = _tier_backend(cheap_model) if cheap_model else None
+        mid_backend = _tier_backend(mid_model) if mid_model else None
         backend = compose_backend(
-            backend, cheap=cheap_backend, cache=cache,
+            backend, cheap=cheap_backend, mid=mid_backend,
+            route_mode=router, min_confidence=min_confidence, cache=cache,
             rpm=rpm, max_usd=max_usd, model_for_cost=config.llm.model,
         )
-        extras = [n for n, on in (("cache", cache), ("router", bool(cheap_model)),
+        routing_on = bool(cheap_model or mid_model)
+        extras = [n for n, on in (("cache", cache), (f"router:{router}", routing_on),
                                   ("max_usd", max_usd is not None), ("rpm", rpm is not None)) if on]
         click.echo(dim(f"  Token-saving: {', '.join(extras)}"))
+        if routing_on:
+            tiers = [m for m in (cheap_model, mid_model, config.llm.model) if m]
+            click.echo(dim(f"  Router tiers (cheap→strong): {' → '.join(tiers)}"))
 
     from tools.shell_tool import terminal_confirm
     from tools.runtime import create_runtime
@@ -308,11 +415,28 @@ def run(
         click.echo(dim(f"  Retriever: RAG ({rag_retriever.chunk_count} chunks, {rag_retriever.backend_info})"))
         if rag_extra:
             click.echo(dim(f"  RAG external: {', '.join(rag_extra)}"))
-    registry = _build_registry(config, confirm_callback=confirm_cb, runtime=runtime)
+    # Long-term memory (#2): enabled by --memory or config; --memory-dir overrides.
+    if memory_dir:
+        config.memory.dir = memory_dir
+    memory_on = memory or config.memory.enabled
+    long_term = _build_memory(str(repo_path), config, enable=memory_on)
+    if long_term is not None:
+        click.echo(dim(f"  Memory: long-term on ({long_term.count} records, {long_term.backend_info})"))
+    # Symbol index (#3): build once so find_symbol is an O(1) indexed lookup.
+    symbol_index = _build_symbol_index(str(repo_path))
+    if symbol_index is not None:
+        click.echo(dim(f"  Symbol index: {symbol_index.symbol_count} symbols "
+                       f"in {symbol_index.name_count} names "
+                       f"({symbol_index.stats.get('reparsed_files', 0)} parsed, "
+                       f"{symbol_index.stats.get('reused_files', 0)} cached)"))
+    from tools.undo_tool import UndoManager
+    undo_manager = UndoManager(sidecar_path=log_dir_path / f"{stem}.undo.jsonl")
+    registry = _build_registry(config, confirm_callback=confirm_cb, runtime=runtime,
+                               memory=long_term, symbol_index=symbol_index,
+                               undo_manager=undo_manager)
 
     from agent.core import Agent, AgentConfig
     from agent.event_log import EventLog, summarize_run
-    from agent.task import Task
     try:
         from context.token_budget import is_tiktoken_available
     except ImportError:
@@ -340,6 +464,9 @@ def run(
         confirm_dangerous=confirm,
         confirm_callback=confirm_cb,
         retriever=rag_retriever,
+        long_term_memory=long_term,
+        memory_top_k=config.memory.top_k,
+        capture_episodes=config.memory.capture_episodes,
     )
     if engine == "langgraph":
         from agent.langgraph_loop import LangGraphAgent
@@ -348,13 +475,6 @@ def run(
     else:
         agent = Agent(backend, registry, agent_config)
 
-    task_obj = Task(
-        description=description,
-        repo_path=str(repo_path),
-        max_steps=config.agent.max_steps,
-        budget_tokens=config.agent.budget_tokens,
-    )
-
     if verbose:
         click.echo(dim(
             f"  tiktoken: {'yes' if is_tiktoken_available() else 'no (char estimate)'}\n"
@@ -362,7 +482,7 @@ def run(
 
     # Run
     t0 = time.time()
-    with EventLog.create(task_obj, log_dir=config.agent.log_dir) as log:
+    with EventLog.create(task_obj, log_dir=config.agent.log_dir, timestamp=run_ts) as log:
         click.echo(dim(f"  Log: {log.path}\n"))
         result = agent.run(task_obj, log)
         # Print all events
@@ -377,7 +497,11 @@ def run(
     click.echo(f"Status  : {status_str}")
     click.echo(f"Steps   : {result.steps_taken}")
     click.echo(f"Tokens  : {result.total_tokens:,}")
-    click.echo(f"Time    : {elapsed:.1f}s")
+    overhead = max(0.0, elapsed - result.llm_time - result.tool_time)
+    click.echo(
+        f"Time    : {elapsed:.1f}s "
+        f"(llm={result.llm_time:.1f}s tool={result.tool_time:.1f}s overhead={overhead:.1f}s)"
+    )
     if result.error:
         click.echo(red(f"Error   : {result.error}"))
     click.echo(bold("─" * 60) + "\n")
@@ -408,14 +532,10 @@ def chat(
     verbose: bool,
 ) -> None:
     """Interactive chat mode — continuous conversation with the agent."""
-    import logging
-    from entry.chat import ChatSession
+    import uuid
+    from datetime import datetime, timezone
 
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)-7s %(name)s — %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    from entry.chat import ChatSession
 
     config = load_config(ctx.obj.get("config_path"))
     config = merge_cli_overrides(config, provider=provider, model=model, max_steps=max_steps)
@@ -424,6 +544,13 @@ def chat(
     if not repo_path.exists():
         click.echo(red(f"Error: repo path does not exist: {repo_path}"), err=True)
         sys.exit(1)
+
+    # Undo and the text log are scoped to the whole session, not one round: the
+    # registry (and so the agent's tools) is shared across every round here.
+    session_stem = (f"chat_{uuid.uuid4().hex[:8]}_"
+                    f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}")
+    log_dir_path = Path(config.agent.log_dir)
+    _setup_logging(verbose, log_dir_path / f"{session_stem}.log")
 
     try:
         backend = create_backend_from_config({
@@ -437,7 +564,9 @@ def chat(
         click.echo(red(f"Error: {e}"), err=True)
         sys.exit(1)
 
-    registry = _build_registry(config)
+    from tools.undo_tool import UndoManager
+    undo_manager = UndoManager(sidecar_path=log_dir_path / f"{session_stem}.undo.jsonl")
+    registry = _build_registry(config, undo_manager=undo_manager)
     from tools.shell_tool import terminal_confirm
     from tools.runtime import create_runtime
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
@@ -564,11 +693,7 @@ def web(
     verbose: bool,
 ) -> None:
     """Serve a browser chat box for the agent (stdlib-only web server)."""
-    logging.basicConfig(
-        level=logging.INFO if verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)-7s %(name)s — %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    _setup_logging(verbose, verbose_level=logging.INFO)
     config = load_config(ctx.obj.get("config_path"))
     config = merge_cli_overrides(config, provider=provider, model=model)
 
@@ -630,11 +755,7 @@ def multi(
     verbose: bool,
 ) -> None:
     """Run the planner → coder → reviewer multi-agent pipeline on a task."""
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)-7s %(name)s — %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    _setup_logging(verbose)
     config = load_config(ctx.obj.get("config_path"))
     config = merge_cli_overrides(config, provider=provider, model=model, max_steps=max_steps)
 
@@ -724,11 +845,10 @@ def eval_cmd(
     verbose: bool,
 ) -> None:
     """Run the benchmark suite and report success rate / steps / tokens."""
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)-7s %(name)s — %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    from datetime import datetime, timezone
+
+    eval_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    _setup_logging(verbose, Path(results_dir) / f"eval_{eval_ts}.log")
 
     config = load_config(ctx.obj.get("config_path"))
     config = merge_cli_overrides(config, provider=provider, model=model, max_steps=max_steps)
@@ -823,6 +943,12 @@ def log_show(log_file: str) -> None:
     click.echo(f"  Actions      : {stats['actions']}")
     click.echo(f"  Reflections  : {stats['reflections']}")
     click.echo(f"  Tool calls   : {stats['tool_calls']}")
+    click.echo(f"  LLM time     : {stats['llm_time_total']:.1f}s")
+    click.echo(f"  Tool time    : {stats['tool_time_total']:.1f}s")
+    if stats["tool_time_by_name"]:
+        slowest = sorted(stats["tool_time_by_name"].items(), key=lambda kv: -kv[1])
+        breakdown = "  ".join(f"{n}={s:.1f}s" for n, s in slowest)
+        click.echo(f"  Time by tool : {breakdown}")
     click.echo(f"  Final status : {stats['final_status']}\n")
 
     click.echo(bold("Events:"))
@@ -848,7 +974,9 @@ def log_list(log_dir: str) -> None:
         click.echo(f"Log directory not found: {log_path}")
         return
 
-    files = sorted(log_path.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    files = sorted((p for p in log_path.glob("*.jsonl")
+                    if not p.name.endswith(".undo.jsonl")),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
         click.echo("No log files found.")
         return
@@ -856,8 +984,86 @@ def log_list(log_dir: str) -> None:
     click.echo(bold(f"\nLog files in {log_path}:\n"))
     for f in files:
         size_kb = f.stat().st_size / 1024
-        click.echo(f"  {f.name}  ({size_kb:.1f} KB)")
+        undo = " [undo available]" if f.with_suffix(".undo.jsonl").exists() else ""
+        click.echo(f"  {f.name}  ({size_kb:.1f} KB){dim(undo)}")
     click.echo()
+
+
+# ---------------------------------------------------------------------------
+# undo subcommand — roll back a previous run's file changes
+# ---------------------------------------------------------------------------
+
+@cli.command("undo")
+@click.argument("target")
+@click.option("--log-dir", default=None, help="Where to look when TARGET is a bare task id")
+@click.option("--file", "only_path", default=None, help="Only restore this one file")
+@click.option("--list", "list_only", is_flag=True, default=False,
+              help="Preview the rollback without changing anything")
+@click.option("--yes", "-y", is_flag=True, default=False, help="Skip the confirmation prompt")
+@click.pass_context
+def undo_cmd(ctx: click.Context, target: str, log_dir: str | None,
+             only_path: str | None, list_only: bool, yes: bool) -> None:
+    """Roll back file changes made by a previous run.
+
+    TARGET is a task id, an event log (.jsonl), or an undo sidecar (.undo.jsonl).
+    Each file is restored to its content from before the run first touched it.
+    """
+    import difflib
+
+    from tools.undo_tool import UndoManager
+
+    config = load_config(ctx.obj.get("config_path"))
+    t = Path(target)
+    if t.name.endswith(".undo.jsonl"):
+        sidecar = t
+    elif t.suffix == ".jsonl":
+        sidecar = UndoManager.sidecar_for_log_path(t)
+    else:
+        sidecar = UndoManager.find_sidecar(Path(log_dir or config.agent.log_dir), target)
+
+    if sidecar is None or not sidecar.exists():
+        click.echo(red(f"No undo snapshot found for '{target}'"), err=True)
+        sys.exit(1)
+
+    plan = UndoManager.rollback_plan(UndoManager.load_sidecar(sidecar), path=only_path)
+    if not plan:
+        click.echo(dim("Nothing to roll back."))
+        return
+
+    click.echo(bold(f"\nRollback plan ({sidecar.name}):"))
+    for m in plan:
+        p = Path(m.path)
+        if not m.existed_before:
+            if p.exists():
+                click.echo(red(f"  delete   {m.path}") + dim("  (created during this run)"))
+            else:
+                click.echo(dim(f"  ok       {m.path}  (already absent)"))
+            continue
+        current = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+        if current == (m.content_before or ""):
+            click.echo(dim(f"  ok       {m.path}  (already at pre-run content)"))
+            continue
+        changed = sum(
+            1 for line in difflib.unified_diff(
+                current.splitlines(), (m.content_before or "").splitlines(), lineterm="")
+            if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+        )
+        click.echo(yellow(f"  restore  {m.path}") + dim(f"  ({changed} lines differ)"))
+
+    if list_only:
+        return
+    if not yes and not click.confirm("\nApply this rollback?"):
+        click.echo(dim("Aborted."))
+        return
+
+    restored = 0
+    for m in plan:
+        try:
+            UndoManager._restore(m)
+            restored += 1
+        except OSError as exc:
+            click.echo(red(f"  failed to restore {m.path}: {exc}"), err=True)
+    click.echo(green(f"Restored {restored} file(s).\n"))
 
 
 # ---------------------------------------------------------------------------

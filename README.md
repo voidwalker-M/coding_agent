@@ -112,6 +112,7 @@ coding-agent/
 │   ├── search_tool.py  # Text search / file find / symbol locate
 │   ├── test_tool.py    # pytest execution + structured result parsing
 │   ├── git_tool.py     # git status / diff / add / commit
+│   ├── undo_tool.py    # Snapshot-based undo (git-independent rollback)
 │   └── runtime.py      # LocalRuntime / DockerRuntime
 │
 ├── context/            # Context management
@@ -120,7 +121,7 @@ coding-agent/
 │   └── history.py      # Conversation history sliding window
 │
 ├── entry/              # Entry layer
-│   ├── cli.py          # Click CLI (run / chat / log subcommands)
+│   ├── cli.py          # Click CLI (run / chat / undo / log subcommands)
 │   ├── chat.py         # ChatSession with persistent cross-round history
 │   └── github_issue.py # GitHub Issue → PR automation
 │
@@ -222,3 +223,25 @@ python -m entry.github_issue \
 ```
 
 See [USAGE.md](USAGE.md) for detailed usage.
+
+---
+
+## Benchmarks
+
+Two objective, agent-driven benchmarks under [benchmarks/](benchmarks/), both
+graded by an independent re-run (the agent's self-reported success is ignored):
+
+```bash
+# HumanEval — single-function completion
+python -m benchmarks.run_humaneval --limit 20
+
+# SWE-bench Lite — fix a real GitHub issue in a real repo (read→plan→edit→test→repair)
+python -m benchmarks.download_swebench --split test        # get the dataset (300 instances)
+python -m benchmarks.run_swebench --mock --instances pytest-dev__pytest-5692   # validate pipeline, no key
+python -m benchmarks.run_swebench --repos psf/requests --limit 3   # evaluate the model
+```
+
+SWE-bench grades with the official "resolved" criterion (all `FAIL_TO_PASS` pass
+**and** all `PASS_TO_PASS` stay passing). This host has no Docker, so grading is
+best-effort — see [benchmarks/README.md](benchmarks/README.md) for the exact
+scope and caveats.

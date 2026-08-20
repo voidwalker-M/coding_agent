@@ -44,6 +44,7 @@ def create_backend(
     api_key: str | None = None,
     base_url: str | None = None,
     max_tokens: int = 4096,
+    max_empty_retries: int | None = None,
 ) -> LLMBackend:
     """
     Factory function that creates the appropriate LLMBackend for a given provider.
@@ -95,11 +96,15 @@ def create_backend(
     # base_url priority: explicit caller argument > provider default
     resolved_base_url = base_url or _PROVIDER_BASE_URLS[provider]
 
+    # Only pass max_empty_retries when the caller overrode it, so the backend's
+    # own default stands otherwise.
+    extra = {} if max_empty_retries is None else {"max_empty_retries": max_empty_retries}
     return OpenAICompatBackend(
         model=model,
         api_key=resolved_key,
         base_url=resolved_base_url,
         max_tokens=max_tokens,
+        **extra,
     )
 
 
@@ -113,11 +118,14 @@ def create_backend_from_config(config: dict) -> LLMBackend:
         api_key: sk-...        # optional; falls back to environment variable
         base_url:              # optional
         max_tokens: 4096       # optional
+        max_empty_retries: 6   # optional; resamples of empty reasoning-model turns
     """
+    mer = config.get("max_empty_retries")
     return create_backend(
         provider=config.get("provider", "anthropic"),
         model=config.get("model", "claude-sonnet-4-5"),
         api_key=config.get("api_key") or None,
         base_url=config.get("base_url") or None,
         max_tokens=int(config.get("max_tokens", 4096)),
+        max_empty_retries=(int(mer) if mer is not None else None),
     )

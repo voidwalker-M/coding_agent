@@ -366,6 +366,35 @@ class TestOpenAICompatBackend:
         assert result.input_tokens == 80
         assert result.output_tokens == 40
 
+    def test_empty_response_is_retried(self):
+        """Reasoning models (e.g. gpt-oss) intermittently end a turn with no
+        content and no tool call. The backend must resample instead of giving
+        up on the first empty turn."""
+        backend = self._make_backend()
+        empty = self._make_response("stop", content=None, tool_calls=None)
+        good = self._make_response(
+            "tool_calls",
+            tool_calls=[self._make_tool_call("shell", {"cmd": "pytest"})],
+        )
+        backend._client.chat.completions.create.side_effect = [empty, good]
+
+        result = backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
+        assert result.action.action_type == ActionType.TOOL_CALL
+        assert result.action.tool_call.name == "shell"
+        # one empty + one good = exactly two API calls
+        assert backend._client.chat.completions.create.call_count == 2
+
+    def test_persistent_empty_response_gives_up(self):
+        """When every resample is still empty, fall back to give_up after a
+        bounded number of attempts (no infinite loop)."""
+        backend = self._make_backend()  # max_empty_retries defaults to 2 -> 3 attempts
+        empty = self._make_response("stop", content=None, tool_calls=None)
+        backend._client.chat.completions.create.side_effect = [empty, empty, empty]
+
+        result = backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
+        assert result.action.action_type == ActionType.GIVE_UP
+        assert backend._client.chat.completions.create.call_count == 3
+
 
 # ===========================================================================
 # OpenAICompatBackend — text-parse fallback (R1 model)
