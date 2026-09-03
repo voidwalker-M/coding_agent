@@ -69,7 +69,7 @@ def _real_factory(config, retriever_kind: str, engine: str, max_steps_override):
     })
 
     def factory(spec, repo_path):
-        registry = _build_registry(config)
+        registry = _build_registry(config, repo_path=repo_path)
         rag = _build_retriever(repo_path, retriever_kind)
         agent_cfg = AgentConfig(
             max_steps=spec.max_steps if max_steps_override is None else max_steps_override,

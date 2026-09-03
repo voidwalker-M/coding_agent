@@ -67,6 +67,45 @@ def test_history_on_evict_folds_into_short_term():
 
 
 # ---------------------------------------------------------------------------
+# ShortTermMemory — conversation window of n queries
+# ---------------------------------------------------------------------------
+
+def test_short_term_query_window_trims_to_n():
+    stm = ShortTermMemory(window_queries=2)
+    stm.append_query("first")
+    stm.append_response("did first")
+    stm.append_query("second")
+    stm.append_query("third")
+    texts = [q.user_text for q in stm.queries]
+    assert texts == ["second", "third"]
+    rendered = stm.render()
+    # Current query stays in ConversationHistory; STM only lists *prior* queries.
+    assert "second" in rendered
+    assert "first" not in rendered or "dropped" in rendered
+
+
+def test_short_term_begin_query_is_idempotent():
+    stm = ShortTermMemory()
+    stm.begin_query("fix the parser")
+    stm.begin_query("fix the parser")
+    assert len(stm.queries) == 1
+
+
+def test_short_term_persists_window_in_sqlite(tmp_path):
+    from context.memory_store import MemoryStore
+    store = MemoryStore(tmp_path / "memory.db")
+    conv = store.create_conversation("alice", title="chat")
+    stm = ShortTermMemory(window_queries=3, store=store, user_id="alice",
+                          conversation_id=conv.id)
+    stm.append_query("how do I parse JSON")
+    stm.append_response("use json.loads")
+    reloaded = ShortTermMemory(window_queries=3, store=store, user_id="alice",
+                               conversation_id=conv.id)
+    assert reloaded.queries[0].user_text == "how do I parse JSON"
+    assert "json.loads" in reloaded.queries[0].responses[0]
+
+
+# ---------------------------------------------------------------------------
 # LongTermMemory — write / persist / dedup
 # ---------------------------------------------------------------------------
 
@@ -206,3 +245,131 @@ def test_remember_tool_requires_text(tmp_path, clock):
     tool = RememberTool(_mem(tmp_path, clock))
     res = tool.execute({"text": ""})
     assert not res.success
+
+
+# ---------------------------------------------------------------------------
+# Multi-user / ACL / cache
+# ---------------------------------------------------------------------------
+
+def test_private_memory_is_invisible_to_other_users(tmp_path, clock):
+    alice = LongTermMemory(str(tmp_path), user_id="alice", role="user",
+                           clock=lambda: clock["now"]).load()
+    alice.remember("Alice's API token lives in secrets.env", kind="user",
+                   visibility="private")
+    bob = LongTermMemory(str(tmp_path), user_id="bob", role="user",
+                         clock=lambda: clock["now"]).load()
+    assert bob.count == 0
+    assert "secrets.env" not in bob.recall("API token")
+    assert "secrets.env" in alice.recall("API token")
+
+
+def test_public_memory_visible_to_guest(tmp_path, clock):
+    agent = LongTermMemory(str(tmp_path), user_id="agent", role="agent",
+                           clock=lambda: clock["now"]).load()
+    agent.remember("The deploy command is make release", kind="reference",
+                   visibility="public", scope="global")
+    guest = LongTermMemory(str(tmp_path), user_id="visitor", role="guest",
+                           clock=lambda: clock["now"]).load()
+    assert "make release" in guest.recall("how do I deploy")
+
+
+def test_shared_acl_grant(tmp_path, clock):
+    alice = LongTermMemory(str(tmp_path), user_id="alice", role="user",
+                           clock=lambda: clock["now"]).load()
+    rec = alice.remember("staging host is staging.internal", kind="reference",
+                         visibility="private")
+    alice.grant(rec.name, "user:bob", perm="read")
+    bob = LongTermMemory(str(tmp_path), user_id="bob", role="user",
+                         clock=lambda: clock["now"]).load()
+    assert "staging.internal" in bob.recall("staging host")
+
+
+def test_sqlite_is_source_of_truth(tmp_path, clock):
+    mem = _mem(tmp_path, clock)
+    mem.remember("parser is recursive descent", kind="project")
+    assert (tmp_path / "memory.db").exists()
+    assert (tmp_path / "MEMORY.md").exists()
+    reloaded = LongTermMemory(str(tmp_path), clock=lambda: clock["now"]).load()
+    assert reloaded.count == 1
+    assert reloaded.store.ltm_all()[0]["kind"] == "project"
+
+
+def test_embed_cache_roundtrip(tmp_path, clock):
+    store = LongTermMemory(str(tmp_path), clock=lambda: clock["now"]).load().store
+    store.cache_set("embed", "abc", b"\x00\x01", ttl_s=60)
+    assert store.cache_get("embed", "abc") == b"\x00\x01"
+    store.cache_set("embed", "old", b"x", ttl_s=-1)
+    assert store.cache_get("embed", "old") is None
+
+
+def test_guest_cannot_write(tmp_path, clock):
+    guest = LongTermMemory(str(tmp_path), user_id="g", role="guest",
+                           clock=lambda: clock["now"]).load()
+    with pytest.raises(PermissionError):
+        guest.remember("should not persist", kind="semantic")
+
+
+def test_pending_memory_is_hidden_until_approved(tmp_path, clock):
+    mem = LongTermMemory(str(tmp_path), clock=lambda: clock["now"],
+                         auto_approve=False).load()
+    rec = mem.propose("prefer tabs in this repo", kind="feedback")
+    assert rec.status == "pending"
+    assert mem.pending()
+    assert "tabs" not in mem.recall("prefer tabs")
+    mem.approve(rec.name)
+    assert "tabs" in mem.recall("prefer tabs")
+
+
+def test_prompt_recall_skips_episodic_logs(tmp_path, clock):
+    mem = _mem(tmp_path, clock)
+    mem.record_episode("Fix parser", outcome="success", summary="handled empty input")
+    mem.remember("use ruff", kind="feedback")
+    always_on = mem.recall("parser ruff", k=5, for_prompt=True)
+    assert "ruff" in always_on.lower()
+    assert "Task: Fix parser" not in always_on
+    on_demand = mem.recall("how did we fix the parser", k=5)
+    assert "empty input" in on_demand
+
+
+# ---------------------------------------------------------------------------
+# ChatGPT-shaped pipeline: extract facts, archive overflow, keep transcript
+# ---------------------------------------------------------------------------
+
+def test_observe_turn_saves_preference_not_chitchat(tmp_path, clock):
+    mem = _mem(tmp_path, clock)
+    written = mem.observe_turn("I prefer concise answers and I don't like long paragraphs")
+    assert written
+    assert "concise" in mem.recall("concise answers preference", k=3, for_prompt=True).lower()
+    assert mem.observe_turn("ok thanks") == []
+    assert mem.count == 1
+
+
+def test_overflow_keeps_sqlite_transcript_and_distills(tmp_path, clock):
+    mem = _mem(tmp_path, clock, user_id="alice")
+    conv_id = mem.new_conversation(title="chat")
+    stm = ShortTermMemory(
+        window_queries=2,
+        store=mem.store,
+        user_id="alice",
+        conversation_id=conv_id,
+        on_overflow=mem.ingest_overflow,
+    )
+    stm.append_query("I prefer concise answers, please never write long paragraphs")
+    stm.append_response("I'll keep replies short.")
+    stm.append_query("look at parser.py next")
+    stm.append_query("now fix the tests")
+
+    texts = [q.user_text for q in stm.queries]
+    assert texts == ["look at parser.py next", "now fix the tests"]
+    rendered = stm.render()
+    assert "parser.py" in rendered
+    assert "prefer concise" not in rendered
+
+    rows = mem.store.stm_load(conv_id)
+    contents = [row["content"] for row in rows]
+    assert any("prefer concise" in c for c in contents)
+    assert any("fix the tests" in c for c in contents)
+
+    prompt = mem.recall("concise answers preference", k=5, for_prompt=True)
+    assert "concise" in prompt.lower()
+    assert any(r.kind == "conversation" for r in mem._records)

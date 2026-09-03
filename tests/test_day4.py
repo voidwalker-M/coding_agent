@@ -80,6 +80,12 @@ class TestBuildSystemPrompt:
         prompt = build_system_prompt(".", [])
         assert "Repository summary not yet available" in prompt
 
+    def test_reread_after_edit_exception(self):
+        prompt = build_system_prompt(".", [])
+        assert "already read" in prompt
+        assert "file_write" in prompt
+        assert "stale" in prompt.lower()
+
 
 class TestBuildTaskPrompt:
     def test_contains_description(self):
@@ -149,6 +155,12 @@ class TestRouter:
         with patch("llm.openai_compat.OpenAICompatBackend.__init__", return_value=None):
             # ollama does not require an api_key
             backend = create_backend("ollama", "llama3", api_key=None)
+        from llm.openai_compat import OpenAICompatBackend
+        assert isinstance(backend, OpenAICompatBackend)
+
+    def test_vllm_no_key_required(self):
+        with patch("llm.openai_compat.OpenAICompatBackend.__init__", return_value=None):
+            backend = create_backend("vllm", "qwen2.5-coder", api_key=None)
         from llm.openai_compat import OpenAICompatBackend
         assert isinstance(backend, OpenAICompatBackend)
 
@@ -383,6 +395,12 @@ class TestOpenAICompatBackend:
         assert result.action.tool_call.name == "shell"
         # one empty + one good = exactly two API calls
         assert backend._client.chat.completions.create.call_count == 2
+        retry_kwargs = backend._client.chat.completions.create.call_args_list[1].kwargs
+        assert retry_kwargs["tool_choice"] == "required"
+        assert any(
+            m.get("role") == "user" and "empty" in (m.get("content") or "").lower()
+            for m in retry_kwargs["messages"]
+        )
 
     def test_persistent_empty_response_gives_up(self):
         """When every resample is still empty, fall back to give_up after a

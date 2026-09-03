@@ -25,6 +25,15 @@ from llm.base import LLMBackend, LLMMessage, LLMResponse, LLMToolSchema
 
 logger = logging.getLogger(__name__)
 
+# Injected on empty-response retries so a reasoning model that "thought" but
+# emitted nothing is forced to take an action instead of resampling the same
+# conversation and stalling again.
+_EMPTY_RESPONSE_NUDGE = (
+    "Your last reply was empty (no tool call and no message). "
+    "You MUST call a tool now to make progress: search, read, edit, or run tests. "
+    "Do not end the turn without a tool call."
+)
+
 # Models that do not support function calling (prefix match)
 _NO_FUNCTION_CALLING: tuple[str, ...] = (
     "deepseek-reasoner",    # DeepSeek R1
@@ -116,17 +125,32 @@ class OpenAICompatBackend(LLMBackend):
         tools: list[LLMToolSchema],
     ) -> LLMResponse:
         api_tools = [_to_openai_tool(t) for t in tools]
+        messages = list(api_messages)
+        # First attempt: auto. After an empty turn, require a tool call so the
+        # model cannot stall again by emitting only a reasoning channel.
+        tool_choice = "auto"
 
         response = None
         for attempt in range(self._max_empty_retries + 1):
-            response = self._client.chat.completions.create(
-                model=self._model,
-                max_tokens=self._max_tokens,
-                messages=api_messages,
-                tools=api_tools,
-                tool_choice="auto",
+            create_kwargs: dict[str, Any] = {
+                "model": self._model,
+                "max_tokens": self._max_tokens,
+                "messages": messages,
+                "tools": api_tools,
+                "tool_choice": tool_choice,
                 **self._logprob_kwargs(),
-            )
+            }
+            try:
+                response = self._client.chat.completions.create(**create_kwargs)
+            except Exception as exc:
+                if tool_choice != "required":
+                    raise
+                logger.warning(
+                    "tool_choice=required rejected (%s); falling back to auto", exc
+                )
+                tool_choice = "auto"
+                create_kwargs["tool_choice"] = "auto"
+                response = self._client.chat.completions.create(**create_kwargs)
             if not _is_empty_response(response.choices[0]):
                 break
             if attempt < self._max_empty_retries:
@@ -136,6 +160,13 @@ class OpenAICompatBackend(LLMBackend):
                     response.choices[0].finish_reason,
                     attempt + 1, self._max_empty_retries,
                 )
+                if not any(
+                    m.get("role") == "user" and m.get("content") == _EMPTY_RESPONSE_NUDGE
+                    for m in messages
+                ):
+                    messages.append({"role": "user", "content": _EMPTY_RESPONSE_NUDGE})
+                if api_tools:
+                    tool_choice = "required"
 
         choice = response.choices[0]
         message = choice.message
@@ -177,12 +208,13 @@ class OpenAICompatBackend(LLMBackend):
                 "content": augmented[0]["content"] + "\n\n" + tool_desc,
             }
 
+        messages = list(augmented)
         response = None
         for attempt in range(self._max_empty_retries + 1):
             response = self._client.chat.completions.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
-                messages=augmented,
+                messages=messages,
                 **self._logprob_kwargs(),
             )
             if (response.choices[0].message.content or "").strip():
@@ -193,6 +225,11 @@ class OpenAICompatBackend(LLMBackend):
                     response.choices[0].finish_reason,
                     attempt + 1, self._max_empty_retries,
                 )
+                if not any(
+                    m.get("role") == "user" and m.get("content") == _EMPTY_RESPONSE_NUDGE
+                    for m in messages
+                ):
+                    messages.append({"role": "user", "content": _EMPTY_RESPONSE_NUDGE})
 
         choice = response.choices[0]
         raw_text = choice.message.content or ""

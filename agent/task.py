@@ -29,6 +29,7 @@ class EventType(str, Enum):
     ACTION          = "action"
     OBSERVATION     = "observation"
     REFLECTION      = "reflection"
+    CHECKPOINT      = "checkpoint"
     TASK_COMPLETE   = "task_complete"
     TASK_FAILED     = "task_failed"
 
@@ -54,6 +55,7 @@ class RunStatus(str, Enum):
     FAILED      = "failed"
     MAX_STEPS   = "max_steps"    # hit the step limit
     GAVE_UP     = "gave_up"      # agent voluntarily gave up
+    INTERRUPTED = "interrupted"  # stopped mid-run; checkpoint available for resume
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +222,10 @@ class RunResult:
     error: str | None = None            # reason when status == FAILED
     llm_time: float = 0.0               # total seconds spent in LLM calls (including retries)
     tool_time: float = 0.0              # total seconds spent executing tools
+    checkpoint_path: str | None = None    # latest checkpoint file when interrupted or resumable
+    resumed_from_step: int = 0          # step restored from when resuming a checkpoint
+    avg_ttft_ms: float | None = None      # mean time-to-first-token across LLM calls (streaming)
+    p95_ttft_ms: float | None = None      # p95 TTFT across LLM calls
 
     def is_success(self) -> bool:
         return self.status == RunStatus.SUCCESS

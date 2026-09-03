@@ -80,21 +80,38 @@ def event_to_web(event) -> dict | None:
 # ---------------------------------------------------------------------------
 
 class ChatWebApp:
-    def __init__(self, backend, registry, config, repo_path: str, log_dir: str) -> None:
+    def __init__(self, backend, registry, config, repo_path: str, log_dir: str,
+                 short_term_memory=None, long_term_memory=None) -> None:
         from agent.core import Agent, AgentConfig
+        from config.schema import agent_compaction_kwargs
         from context.history import ConversationHistory
+        from context.memory import ShortTermMemory
 
         self.repo_path = repo_path
         self.log_dir = log_dir
         self.config = config
         self._lock = threading.Lock()
         self._q: queue.Queue | None = None
+        mem_cfg = getattr(config, "memory", None)
+        self._long_term = long_term_memory
+        overflow = long_term_memory.ingest_overflow if long_term_memory is not None else None
+        if short_term_memory is not None:
+            self._short_term = short_term_memory
+        else:
+            self._short_term = ShortTermMemory(
+                window_queries=getattr(mem_cfg, "window_queries", 10),
+                on_overflow=overflow,
+            )
 
         agent_cfg = AgentConfig(
             max_steps=config.agent.max_steps,
             budget_tokens=config.agent.budget_tokens,
             history_max_messages=config.context.history_window * 2,
             stream=False,   # web feed is event-based, not token-based
+            short_term_memory=self._short_term,
+            long_term_memory=long_term_memory,
+            memory_window_queries=getattr(mem_cfg, "window_queries", 10),
+            **agent_compaction_kwargs(config.context),
         )
         self.agent = Agent(backend, registry, agent_cfg)
         self._history = ConversationHistory(max_messages=config.context.history_window * 2)
@@ -113,6 +130,7 @@ class ChatWebApp:
         try:
             self.round_count += 1
             self._history.add(LLMMessage(role="user", content=message))
+            self._short_term.begin_query(message)
             task = Task(description=message, repo_path=self.repo_path,
                         max_steps=self.config.agent.max_steps,
                         budget_tokens=self.config.agent.budget_tokens)
@@ -134,6 +152,12 @@ class ChatWebApp:
                 self._history.add(LLMMessage(
                     role="assistant",
                     content=f"[Round {self.round_count} complete]\n{result.summary}"))
+                self._short_term.append_response(result.summary)
+                if self._long_term is not None and hasattr(self._long_term, "observe_turn"):
+                    try:
+                        self._long_term.observe_turn(message, result.summary)
+                    except Exception:
+                        pass
             q.put({"type": "answer", "text": result.summary or "(no summary)",
                    "status": result.status.value, "steps": result.steps_taken,
                    "tokens": result.total_tokens})

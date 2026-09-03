@@ -42,6 +42,8 @@ pip install -e ".[dev]"
 agent --help
 ```
 
+Tests (inventory, extras, how to run): [docs/TESTING.md](docs/TESTING.md).
+
 **Optional: install additional language parsing support** (for more precise repo-map analysis across more languages)
 
 ```bash

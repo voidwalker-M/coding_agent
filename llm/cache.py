@@ -97,15 +97,45 @@ class CachingBackend(LLMBackend):
         inner: LLMBackend,
         embed_fn: EmbedFn | None = None,
         similarity_threshold: float = 0.97,
+        kv=None,
+        ttl_s: float | None = 3600.0,
     ) -> None:
         self._inner = inner
         self._embed_fn = embed_fn
         self._threshold = similarity_threshold
+        self._kv = kv
+        self._ttl_s = ttl_s
         self._exact: dict[str, dict] = {}                  # key -> action dict
         self._semantic: list[tuple[list[float], dict]] = []  # (embedding, action dict)
         self.hits = 0
         self.misses = 0
         self.tokens_saved = 0
+
+    def _exact_get(self, key: str) -> dict | None:
+        if key in self._exact:
+            return self._exact[key]
+        if self._kv is None:
+            return None
+        try:
+            raw = self._kv.get("llm", key)
+            if not raw:
+                return None
+            action_dict = json.loads(raw.decode("utf-8"))
+            self._exact[key] = action_dict
+            return action_dict
+        except Exception as exc:
+            logger.debug("LLM kv cache read failed: %s", exc)
+            return None
+
+    def _exact_put(self, key: str, action_dict: dict) -> None:
+        self._exact[key] = action_dict
+        if self._kv is None:
+            return
+        try:
+            blob = json.dumps(action_dict, ensure_ascii=False).encode("utf-8")
+            self._kv.set("llm", key, blob, ttl_s=self._ttl_s)
+        except Exception as exc:
+            logger.debug("LLM kv cache write failed: %s", exc)
 
     @property
     def model_name(self) -> str:
@@ -133,10 +163,11 @@ class CachingBackend(LLMBackend):
     ) -> LLMResponse:
         key = _request_key(self.model_name, messages, tools)
 
-        # 1. Exact cache.
-        if key in self._exact:
+        # 1. Exact cache (in-process, then optional Redis).
+        cached = self._exact_get(key)
+        if cached is not None:
             logger.debug("LLM cache: exact hit")
-            return self._hit_response(self._exact[key], est_tokens=self._avg_tokens())
+            return self._hit_response(cached, est_tokens=self._avg_tokens())
 
         # 2. Semantic cache (optional).
         query_emb = None
@@ -158,7 +189,7 @@ class CachingBackend(LLMBackend):
         self.misses += 1
         resp = self._inner.complete(messages, tools)
         action_dict = _action_to_dict(resp.action)
-        self._exact[key] = action_dict
+        self._exact_put(key, action_dict)
         if self._embed_fn is not None:
             try:
                 emb = query_emb if query_emb is not None else self._embed_fn(self._semantic_text(messages))
@@ -170,14 +201,15 @@ class CachingBackend(LLMBackend):
     def stream(self, messages, tools, on_text=None, on_thought=None):
         # On a cache hit there is nothing to stream; emit the cached text once.
         key = _request_key(self.model_name, messages, tools)
-        if key in self._exact:
-            resp = self._hit_response(self._exact[key], est_tokens=self._avg_tokens())
+        cached = self._exact_get(key)
+        if cached is not None:
+            resp = self._hit_response(cached, est_tokens=self._avg_tokens())
             if on_text:
                 on_text(resp.raw_content)
             return resp
         resp = self._inner.stream(messages, tools, on_text=on_text, on_thought=on_thought) \
             if hasattr(self._inner, "stream") else self._inner.complete(messages, tools)
-        self._exact[key] = _action_to_dict(resp.action)
+        self._exact_put(key, _action_to_dict(resp.action))
         return resp
 
     # -- helpers --

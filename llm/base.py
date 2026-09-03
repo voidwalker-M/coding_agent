@@ -221,6 +221,35 @@ class MockBackend(LLMBackend):
         self.received_messages.clear()
 
 
+class OfflineBackend(LLMBackend):
+    """Used by `agent serve` when no LLM API key is configured.
+
+    Memory / cache APIs still work. `/v1/tasks` returns a finish action explaining
+    that a key is required.
+    """
+
+    @property
+    def model_name(self) -> str:
+        return "offline"
+
+    def complete(
+        self,
+        messages: list[LLMMessage],
+        tools: list[LLMToolSchema],
+    ) -> LLMResponse:
+        msg = (
+            "No LLM API key configured. Memory and cache endpoints still work. "
+            "Set GPT_OSS_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, or DEEPSEEK_API_KEY "
+            "to run coding tasks."
+        )
+        return LLMResponse(
+            action=Action(ActionType.FINISH, thought="offline", message=msg),
+            raw_content=msg,
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Streaming support
 # ---------------------------------------------------------------------------

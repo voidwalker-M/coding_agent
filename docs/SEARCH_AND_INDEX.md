@@ -19,8 +19,8 @@ Files: [context/symbol_index.py](../context/symbol_index.py) (new),
 |---|---|---|---|
 | **Exact tools** (`search_text`, `find_files`) | "line/​file containing X" | none (walk + regex) | O(files) per call |
 | **Symbol index** (`find_symbol`) | "where is `foo` defined?" | inverted `name → [loc]` | **O(1) after one build** |
-| **Repo-map** | "what's in this repo?" | ranked symbol summary | built once/task |
-| **RAG** (`retriever`) | "code related to this idea" | dense + sparse index | built once, incremental |
+| **Repo-map** | "what's in this repo?" | ranked symbol summary | built per task; rebuilt after edits |
+| **RAG** (`retriever`) | "code related to this idea" | dense + sparse index | content-hash incremental; prompt cache dropped after edits |
 
 The agent is told (system prompt) to prefer targeted tools over dumping whole files —
 the layers exist so it rarely needs to read a file just to locate something.

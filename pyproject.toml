@@ -43,13 +43,29 @@ langgraph = [
     "langchain-core>=0.3.0",
     "pydantic>=2.0",
 ]
+server = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "grpcio>=1.60.0",
+    "protobuf>=4.25.0",
+    "mcp[cli]>=1.7.0",
+    "psycopg[binary]>=3.1",
+    "redis>=5.0",
+]
+stack = [
+    "psycopg[binary]>=3.1",
+    "redis>=5.0",
+]
+browser = [
+    "playwright>=1.40.0",
+]
 
 [project.scripts]
 agent = "entry.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agent*", "llm*", "tools*", "context*", "entry*", "config*"]
+include = ["agent*", "llm*", "tools*", "context*", "entry*", "config*", "eval*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -4,7 +4,7 @@
 
 An autonomous coding agent. Give it a task description and it explores the codebase, edits files, and runs tests until the task is complete.
 
-Supports **Claude, DeepSeek, OpenAI, Groq, Ollama** and more, with built-in streaming output, Docker sandboxing, and GitHub Issue auto-fix.
+Supports **Claude, DeepSeek, OpenAI, Groq, Ollama, vLLM** and more, with built-in streaming output, Docker sandboxing, and GitHub Issue auto-fix.
 
 ---
 
@@ -65,6 +65,23 @@ python -m entry.github_issue \
 
 Automatically fetches the Issue → runs the agent → submits a PR.
 
+### Multi-agent
+
+```bash
+agent multi --task "Fix failing tests" --topology pipeline   # planner → coder ⟲ reviewer
+agent multi --task "..." --topology pair                     # coder ⟲ reviewer
+agent multi --task "..." --topology debate                   # two plans, then coder
+agent multi --task "..." --topology autonomous               # single agent
+```
+
+### Eval
+
+```bash
+agent eval --engine native --output native.json
+agent eval --engine langgraph --output langgraph.json
+python -m eval.compare --labels native,langgraph native.json langgraph.json
+```
+
 ---
 
 ## Configuration
@@ -73,7 +90,7 @@ Edit `config/default.yaml`:
 
 ```yaml
 llm:
-  provider: deepseek                      # anthropic | openai | deepseek | groq | ollama
+  provider: deepseek                      # anthropic | openai | deepseek | groq | ollama | vllm
   model: deepseek-v4-flash
   api_key: ${DEEPSEEK_API_KEY}            # read from environment variable
   base_url: https://api.deepseek.com      # fill in for OpenAI-compatible providers; leave blank for anthropic
@@ -95,6 +112,10 @@ context:
 coding-agent/
 ├── agent/              # Core: ReAct main loop, event log, data structures
 │   ├── core.py         # Agent class driving the entire run loop
+│   ├── decision.py     # Loop / finish / reflection policy
+│   ├── plan.py         # Structured numbered checklist
+│   ├── orchestrator.py # Multi-agent topologies
+│   ├── workflow.py     # Ticket → run → verify → memory
 │   ├── task.py         # Task / Action / Observation / RunResult dataclasses
 │   ├── event_log.py    # JSONL append-only event stream with replay support
 │   └── prompt.py       # System prompt templates
@@ -112,24 +133,27 @@ coding-agent/
 │   ├── search_tool.py  # Text search / file find / symbol locate
 │   ├── test_tool.py    # pytest execution + structured result parsing
 │   ├── git_tool.py     # git status / diff / add / commit
+│   ├── plan_tool.py    # Numbered checklist
+│   ├── skill_tool.py   # Load named SOP / SKILL.md playbooks
+│   ├── browser_tool.py # web_fetch (http/https; optional Playwright)
 │   ├── undo_tool.py    # Snapshot-based undo (git-independent rollback)
 │   └── runtime.py      # LocalRuntime / DockerRuntime
 │
 ├── context/            # Context management
 │   ├── repo_map.py     # tree-sitter multi-language symbol extraction, repo summary
 │   ├── token_budget.py # Token budget allocation and trimming
-│   └── history.py      # Conversation history sliding window
+│   ├── history.py      # Conversation history sliding window
+│   ├── rules.py        # AGENTS.md / CLAUDE.md / .cursor/rules
+│   ├── skills.py       # SKILL.md SOP catalog
+│   └── rag.py          # Hybrid retrieval (optional)
 │
-├── entry/              # Entry layer
-│   ├── cli.py          # Click CLI (run / chat / undo / log subcommands)
-│   ├── chat.py         # ChatSession with persistent cross-round history
-│   └── github_issue.py # GitHub Issue → PR automation
+├── config/             # default.yaml + schema
+├── eval/               # Harness: suite, verifiers, trajectory metrics, report compare
+├── entry/              # CLI, chat, FastAPI, MCP, GitHub Issue, web UI
+├── docs/               # Architecture, memory, RAG, skills, harness, testing
 │
-├── config/
-│   ├── default.yaml    # Default configuration
-│   └── schema.py       # Configuration loading and validation
-│
-├── tests/              # 376 tests covering all modules
+├── tests/              # pytest suite — see docs/TESTING.md for inventory and counts
+├── examples/skills/    # Sample SOP playbooks (copy into a repo's .agent/skills/)
 ├── smoke_test.py       # End-to-end connectivity verification
 ├── quicksort_task.py   # Example task script
 └── USAGE.md            # Full usage guide
@@ -141,7 +165,7 @@ coding-agent/
 
 **Multi-model support**
 - Anthropic Claude (native tool_use)
-- OpenAI, DeepSeek, Groq, Ollama (OpenAI-compatible)
+- OpenAI, DeepSeek, Groq, Ollama, vLLM (OpenAI-compatible; local quant/serve via Ollama or vLLM)
 - Models that don't support function calling (e.g. DeepSeek R1) use a text-parse fallback
 - Switch with one line in the config file, or override temporarily via `--model`
 
@@ -167,6 +191,12 @@ Model thoughts are printed token by token in real time; tool calls are shown imm
 **Event log**
 Each run generates a JSONL log recording all actions / observations / reflections with full replay and statistical analysis support.
 
+**Skills / MCP / web_fetch**
+Named SOP playbooks (`.agent/skills/*/SKILL.md`) are catalogued in the prompt and loaded with the `skill` tool. `agent mcp` exposes the same tools to Cursor / Claude Desktop. `web_fetch` reads http(s) pages (stdlib GET; optional Playwright for JS). See [docs/SKILLS.md](docs/SKILLS.md).
+
+**Eval harness**
+`agent eval` grades tasks with an independent verifier (not the model's FINISH). Trajectory metrics and `python -m eval.compare` support iteration. See [docs/HARNESS.md](docs/HARNESS.md).
+
 ---
 
 ## Safety Notes
@@ -189,9 +219,16 @@ Each run generates a JSONL log recording all actions / observations / reflection
 # Install development dependencies
 pip install -e ".[dev]"
 
-# Run tests
-pytest                     # full suite (376 passed, 7 skipped)
-pytest tests/test_day3.py  # single file
+# Run tests (use the venv interpreter — see docs/TESTING.md)
+.venv/bin/python -m pytest                     # 2026-08-20: 572 passed, 11 skipped
+.venv/bin/python -m pytest tests/test_skills.py
+.venv/bin/python -m pytest tests/test_browser_tool.py
+
+# Optional extras
+pip install -e ".[rag]"         # numpy / faiss for RAG tests
+pip install -e ".[langgraph]"   # LangGraph engine tests
+pip install -e ".[server]"      # FastAPI + MCP
+pip install -e ".[browser]" && playwright install chromium   # JS-rendered web_fetch
 
 # Optional: tree-sitter support for more languages
 pip install tree-sitter-javascript tree-sitter-typescript \
@@ -200,6 +237,10 @@ pip install tree-sitter-javascript tree-sitter-typescript \
 # Optional: accurate token counting
 pip install tiktoken
 ```
+
+Test inventory, extras, and how we count the suite: [docs/TESTING.md](docs/TESTING.md).
+Harness / eval loop: [docs/HARNESS.md](docs/HARNESS.md).
+Skills / SOP wrapping: [docs/SKILLS.md](docs/SKILLS.md).
 
 ---
 
@@ -217,12 +258,24 @@ agent run --task TEXT [--repo PATH] [--task-file FILE]
 agent log list [--dir DIR]
 agent log show LOG_FILE
 
+# multi
+agent multi --task TEXT [--topology pipeline|pair|debate|autonomous] [-i ITER]
+
+# eval
+agent eval [--engine native|langgraph] [-o REPORT.json]
+python -m eval.compare [--labels a,b] a.json b.json
+
+# mcp / serve / web
+agent mcp --repo PATH
+agent serve --repo PATH
+agent web --repo PATH
+
 # github issue
 python -m entry.github_issue \
     -r owner/repo -i ISSUE_NUM -l LOCAL_PATH [--no-pr] [-v]
 ```
 
-See [USAGE.md](USAGE.md) for detailed usage.
+See [USAGE.md](USAGE.md) for detailed usage. Chinese feature overview: [docs/功能说明.md](docs/功能说明.md).
 
 ---
 

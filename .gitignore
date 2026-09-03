@@ -11,6 +11,8 @@ __pycache__/
 
 # Generated run artifacts / caches (may contain repo content; keep local)
 .rag_cache/
+.symbol_cache/
+.agent_memory/
 eval_runs/
 
 # Session-generated documentation — intentionally NOT published

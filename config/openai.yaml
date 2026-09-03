@@ -1,0 +1,27 @@
+# Official OpenAI API — use with:
+#   export OPENAI_API_KEY=sk-...
+#   agent chat -c config/openai.yaml
+#   docker run ... -e OPENAI_API_KEY coding-agent -c /opt/coding-agent/config/openai.yaml chat --repo /workspace
+
+llm:
+  provider: openai
+  model: gpt-4o
+  api_key: ${OPENAI_API_KEY}
+  base_url:                       # empty = official https://api.openai.com
+  max_tokens: 4096
+
+agent:
+  max_steps: 40
+  budget_tokens: 80000
+  log_dir: ./logs
+
+tools:
+  shell:
+    timeout: 30
+    max_output_tokens: 8000
+  file:
+    max_view_lines: 100
+
+context:
+  repo_map_budget: 8000
+  history_window: 20

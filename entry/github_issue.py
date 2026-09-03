@@ -43,17 +43,16 @@ logger = logging.getLogger(__name__)
 
 def _get_github_client():
     """Initialize a PyGithub client, reading the token from the environment variable."""
-    try:
-        from github import Github
-    except ImportError:
-        raise ImportError("PyGithub not installed. Run: pip install PyGithub")
-
     token = os.environ.get("GITHUB_TOKEN", "")
     if not token:
         raise ValueError(
             "GITHUB_TOKEN environment variable is not set.\n"
             "Create a token at https://github.com/settings/tokens"
         )
+    try:
+        from github import Github
+    except ImportError:
+        raise ImportError("PyGithub not installed. Run: pip install PyGithub")
     return Github(token)
 
 
@@ -225,11 +224,13 @@ def run_on_issue(
         return 1
 
     from entry.cli import _build_registry
-    registry = _build_registry(config)
+    registry = _build_registry(config, repo_path=local_path)
 
     agent_config = AgentConfig(
         max_steps=config.agent.max_steps,
         budget_tokens=config.agent.budget_tokens,
+        require_edit_before_finish=True,
+        require_test_before_finish=True,
     )
     agent = Agent(backend, registry, agent_config)
 
@@ -241,11 +242,21 @@ def run_on_issue(
         budget_tokens=config.agent.budget_tokens,
     )
 
-    # 5. Run the agent
+    from agent.workflow import ClosedLoop, Ticket
+    ticket = Ticket(
+        id=str(issue_number),
+        title=title,
+        body=body,
+        source="github",
+    )
+    loop = ClosedLoop(agent, verify_cmd=None, remember_on_success=False)
+
+    # 5. Run the closed loop (ticket → agent → status)
     click.echo(f"\nRunning agent on issue #{issue_number} ...")
     t0 = time.time()
     with EventLog.create(task, log_dir=config.agent.log_dir) as log:
-        result = agent.run(task, log)
+        outcome = loop.execute(ticket, task, log)
+    result = outcome.run
 
     elapsed = time.time() - t0
     click.echo(f"  Status : {result.status.value}")

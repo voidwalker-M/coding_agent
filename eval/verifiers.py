@@ -14,6 +14,7 @@ verifier's objective re-run result is the ground truth.
 from __future__ import annotations
 
 import subprocess
+import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -41,7 +42,7 @@ class PytestVerifier(Verifier):
     def __call__(self, repo_path: str) -> tuple[bool, str]:
         try:
             proc = subprocess.run(
-                ["python", "-m", "pytest", self._path, "-q", "--no-header", "--tb=line"],
+                [sys.executable, "-m", "pytest", self._path, "-q", "--no-header", "--tb=line"],
                 cwd=repo_path, capture_output=True, text=True, timeout=self._timeout,
             )
         except subprocess.TimeoutExpired:

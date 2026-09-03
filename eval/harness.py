@@ -82,6 +82,10 @@ class EvalResult:
     cost_usd: float = 0.0       # estimated $ cost (blended; 0 if tokens unknown)
     llm_time: float = 0.0       # seconds in LLM calls, summed across attempts
     tool_time: float = 0.0      # seconds executing tools, summed across attempts
+    tool_errors: int = 0
+    duplicate_actions: int = 0
+    reflections: int = 0
+    time_to_first_edit: float | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -97,6 +101,10 @@ class EvalResult:
             "elapsed": round(self.elapsed, 2),
             "llm_time": round(self.llm_time, 2),
             "tool_time": round(self.tool_time, 2),
+            "tool_errors": self.tool_errors,
+            "duplicate_actions": self.duplicate_actions,
+            "reflections": self.reflections,
+            "time_to_first_edit": self.time_to_first_edit,
             "detail": self.detail,
             "error": self.error,
         }
@@ -160,6 +168,21 @@ class EvalReport:
     def total_tool_time(self) -> float:
         return sum(r.tool_time for r in self.results)
 
+    @property
+    def total_tool_errors(self) -> int:
+        return sum(r.tool_errors for r in self.results)
+
+    @property
+    def total_duplicate_actions(self) -> int:
+        return sum(r.duplicate_actions for r in self.results)
+
+    @property
+    def avg_time_to_first_edit(self) -> float | None:
+        times = [r.time_to_first_edit for r in self.results if r.time_to_first_edit is not None]
+        if not times:
+            return None
+        return sum(times) / len(times)
+
     def to_dict(self) -> dict:
         return {
             "summary": {
@@ -175,6 +198,12 @@ class EvalReport:
                 "total_time": round(self.total_time, 2),
                 "total_llm_time": round(self.total_llm_time, 2),
                 "total_tool_time": round(self.total_tool_time, 2),
+                "total_tool_errors": self.total_tool_errors,
+                "total_duplicate_actions": self.total_duplicate_actions,
+                "avg_time_to_first_edit": (
+                    round(self.avg_time_to_first_edit, 2)
+                    if self.avg_time_to_first_edit is not None else None
+                ),
             },
             "results": [r.to_dict() for r in self.results],
         }
@@ -206,6 +235,13 @@ class EvalReport:
         rows.append(
             f"Time split: llm={self.total_llm_time:.1f}s  tool={self.total_tool_time:.1f}s  "
             f"other={max(0.0, self.total_time - self.total_llm_time - self.total_tool_time):.1f}s"
+        )
+        tfe = self.avg_time_to_first_edit
+        tfe_s = f"{tfe:.2f}s" if tfe is not None else "n/a"
+        rows.append(
+            f"Trajectory: tool_errors={self.total_tool_errors}  "
+            f"duplicate_actions={self.total_duplicate_actions}  "
+            f"avg_t_first_edit={tfe_s}"
         )
         if self.multi_attempt:
             rows.append(
@@ -279,6 +315,7 @@ class EvalHarness:
         tot_steps = tot_tokens = 0
         tot_elapsed = 0.0
         tot_llm_time = tot_tool_time = 0.0
+        traj_acc: dict | None = None
         # Representative metadata: the first PASSING attempt if any, else the first attempt.
         rep_status = "crashed"
         rep_detail = ""
@@ -314,6 +351,11 @@ class EvalHarness:
                 os.chdir(repo_path)
                 with EventLog.create(task, log_dir=str(log_dir)) as log:
                     run_result = agent.run(task, log)
+                    from eval.trajectory import merge_trajectory, trajectory_metrics
+                    try:
+                        traj_acc = merge_trajectory(traj_acc, trajectory_metrics(log))
+                    except Exception:
+                        pass
             except Exception as exc:
                 run_error = f"agent crashed: {exc}"
                 logger.exception("Agent crashed on task %s", spec.id)
@@ -357,6 +399,10 @@ class EvalHarness:
             cost_usd=estimate_cost(self._model_name, tot_tokens),
             llm_time=tot_llm_time,
             tool_time=tot_tool_time,
+            tool_errors=(traj_acc or {}).get("tool_errors", 0),
+            duplicate_actions=(traj_acc or {}).get("duplicate_actions", 0),
+            reflections=(traj_acc or {}).get("reflections", 0),
+            time_to_first_edit=(traj_acc or {}).get("time_to_first_edit"),
         )
 
         if not self._keep:

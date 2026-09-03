@@ -1,0 +1,70 @@
+# Postgres + Redis + Agent API
+#
+#   docker compose up --build
+#   curl http://localhost:8766/health
+#
+# Memory/cache APIs work without an LLM key. Coding tasks need one of:
+#   GPT_OSS_API_KEY (or GPT_OSS_API_KEY) / OPENAI_API_KEY / ANTHROPIC_API_KEY / DEEPSEEK_API_KEY
+#
+# Point llm.provider at a local runtime if you have one on the host:
+#   provider: ollama    base_url: http://host.docker.internal:11434/v1
+#   provider: vllm      base_url: http://host.docker.internal:8000/v1
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+      POSTGRES_DB: agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  agent:
+    build: .
+    ports:
+      - "8766:8766"
+    environment:
+      MEMORY_ENABLED: "true"
+      MEMORY_DATABASE_URL: postgresql://agent:agent@postgres:5432/agent
+      DATABASE_URL: postgresql://agent:agent@postgres:5432/agent
+      REDIS_URL: redis://redis:6379/0
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GPT_OSS_API_KEY: ${GPT_OSS_API_KEY:-}
+      GPT_OSS_API_KEY: ${GPT_OSS_API_KEY:-${GPT_OSS_API_KEY:-}}
+    volumes:
+      - .:/workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["serve", "--host", "0.0.0.0", "--port", "8766", "--repo", "/workspace"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8766/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+volumes:
+  postgres_data:

@@ -20,10 +20,19 @@ tools:
 context:
   repo_map_budget: 8000 # max tokens for repo-map
   history_window: 20 # number of most recent conversation rounds to retain
+  compaction:
+    enabled: false # LLM summarization when history exceeds trigger_tokens
+    trigger_tokens: 24000 # compact when total history tokens exceed this
+    keep_recent_messages: 8 # preserve the newest N messages verbatim
+    min_messages_to_compact: 4 # need at least this many middle turns to compact
 
 memory:
   enabled: false # persistent long-term memory across runs (--memory to enable on the CLI)
-  dir: "" # empty → <repo>/.agent_memory ; markdown files + MEMORY.md index live here
+  dir: "" # empty → <repo>/.agent_memory ; sqlite memory.db + markdown cache live here
   top_k: 4 # number of long-term memories recalled and injected per task
   max_records: 500 # cap before consolidation evicts the weakest (recency/importance decayed)
   capture_episodes: true # store an episodic memory (task→outcome) at end of each run
+  window_queries: 10 # short-term memory: last N user queries in the conversation
+  default_user: default # actor id for CLI/single-user runs
+  default_role: agent # guest | user | agent | admin — filters long-term recall
+  auto_approve: true # false = Cursor-style pending memories until approve()

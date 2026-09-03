@@ -11,7 +11,7 @@ import os
 import pytest
 
 from agent.core import AgentConfig
-from agent.orchestrator import Orchestrator, READ_ONLY_TOOLS
+from agent.orchestrator import Orchestrator, OrchestratorAgent, READ_ONLY_TOOLS, REVIEWER_EXTRA_TOOLS
 from agent.task import Action, ActionType, RunStatus, Task, ToolCall
 from llm.base import MockBackend
 from tools.base import ToolRegistry
@@ -32,6 +32,10 @@ def test_subset_restricts_tools():
     assert "file_read" in ro.tool_names
     assert "file_write" not in ro.tool_names      # editing tool excluded
     assert "pytest" not in ro.tool_names
+    assert "test" not in ro.tool_names
+    reviewer = reg.subset(READ_ONLY_TOOLS + REVIEWER_EXTRA_TOOLS)
+    assert "test" in reviewer.tool_names
+    assert "file_write" not in reviewer.tool_names
 
 
 def _make_repo(tmp_path):
@@ -119,3 +123,66 @@ def test_on_role_start_callback_fires(tmp_path):
     finally:
         os.chdir(prev)
     assert seen == ["planner", "coder", "reviewer"]
+
+
+def test_pair_topology_skips_planner(tmp_path):
+    repo = _make_repo(tmp_path)
+    script = [
+        Action(ActionType.FINISH, "code", message="done"),
+        Action(ActionType.FINISH, "review", message="APPROVE"),
+    ]
+    orch = Orchestrator(MockBackend(script), _full_registry(),
+                        AgentConfig(max_steps=3), max_iterations=1,
+                        topology="pair")
+    prev = os.getcwd()
+    try:
+        os.chdir(repo)
+        result = orch.run(Task(description="x", repo_path=str(repo), max_steps=3),
+                          log_dir=str(tmp_path / "logs"))
+    finally:
+        os.chdir(prev)
+    assert result.topology == "pair"
+    assert result.approved is True
+    assert [r.role for r in result.roles] == ["coder", "reviewer"]
+
+
+def test_autonomous_topology_single_role(tmp_path):
+    repo = _make_repo(tmp_path)
+    script = [Action(ActionType.FINISH, "solo", message="finished")]
+    orch = Orchestrator(MockBackend(script), _full_registry(),
+                        AgentConfig(max_steps=3), topology="autonomous")
+    prev = os.getcwd()
+    try:
+        os.chdir(repo)
+        result = orch.run(Task(description="x", repo_path=str(repo), max_steps=3),
+                          log_dir=str(tmp_path / "logs"))
+    finally:
+        os.chdir(prev)
+    assert result.approved is True
+    assert [r.role for r in result.roles] == ["autonomous"]
+    assert orch.scratchpad.entries
+
+
+def test_orchestrator_agent_matches_agent_run_signature(tmp_path):
+    from agent.event_log import EventLog
+    from agent.task import RunResult
+
+    repo = _make_repo(tmp_path)
+    script = [
+        Action(ActionType.FINISH, "code", message="done"),
+        Action(ActionType.FINISH, "review", message="APPROVE"),
+    ]
+    wrapper = OrchestratorAgent(
+        Orchestrator(MockBackend(script), _full_registry(),
+                     AgentConfig(max_steps=3), max_iterations=1, topology="pair"),
+    )
+    task = Task(description="x", repo_path=str(repo), max_steps=3)
+    prev = os.getcwd()
+    try:
+        os.chdir(repo)
+        with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
+            result = wrapper.run(task, log)
+    finally:
+        os.chdir(prev)
+    assert isinstance(result, RunResult)
+    assert result.status == RunStatus.SUCCESS

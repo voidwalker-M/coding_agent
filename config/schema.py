@@ -59,9 +59,18 @@ class ToolsConfig:
 
 
 @dataclass
+class CompactionConfig:
+    enabled: bool = False
+    trigger_tokens: int = 24_000
+    keep_recent_messages: int = 8
+    min_messages_to_compact: int = 4
+
+
+@dataclass
 class ContextConfig:
     repo_map_budget: int = 8_000
     history_window: int = 20
+    compaction: CompactionConfig = field(default_factory=CompactionConfig)
 
 
 @dataclass
@@ -71,6 +80,10 @@ class MemoryConfig:
     top_k: int = 4                # long-term records recalled per task
     max_records: int = 500        # cap before consolidation evicts the weakest
     capture_episodes: bool = True # store an episodic memory at end of each run
+    window_queries: int = 10      # short-term conversation window (n user queries)
+    default_user: str = "default"
+    default_role: str = "agent"   # guest | user | agent | admin
+    auto_approve: bool = True     # False → proposed memories stay pending (Cursor-style)
 
 
 @dataclass
@@ -165,6 +178,7 @@ def _parse(data: dict[str, Any]) -> AppConfig:
     context = ContextConfig(
         repo_map_budget=int(context_raw.get("repo_map_budget", 8_000)),
         history_window=int(context_raw.get("history_window", 20)),
+        compaction=_parse_compaction(context_raw.get("compaction", {})),
     )
 
     memory = MemoryConfig(
@@ -173,9 +187,44 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         top_k=int(memory_raw.get("top_k", 4)),
         max_records=int(memory_raw.get("max_records", 500)),
         capture_episodes=bool(memory_raw.get("capture_episodes", True)),
+        window_queries=int(memory_raw.get("window_queries", 10)),
+        default_user=str(memory_raw.get("default_user", "default") or "default"),
+        default_role=str(memory_raw.get("default_role", "agent") or "agent"),
+        auto_approve=bool(memory_raw.get("auto_approve", True)),
     )
 
     return AppConfig(llm=llm, agent=agent, tools=tools, context=context, memory=memory)
+
+
+def _parse_compaction(raw: dict[str, Any]) -> CompactionConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    return CompactionConfig(
+        enabled=bool(raw.get("enabled", False)),
+        trigger_tokens=int(raw.get("trigger_tokens", 24_000)),
+        keep_recent_messages=int(raw.get("keep_recent_messages", 8)),
+        min_messages_to_compact=int(raw.get("min_messages_to_compact", 4)),
+    )
+
+
+def agent_compaction_kwargs(context: ContextConfig, *, enabled_override: bool | None = None) -> dict[str, int | bool]:
+    """Map ContextConfig.compaction → AgentConfig keyword arguments."""
+    c = getattr(context, "compaction", None)
+    if c is None:
+        enabled = False if enabled_override is None else enabled_override
+        return {
+            "compaction_enabled": enabled,
+            "compaction_trigger_tokens": 24_000,
+            "compaction_keep_recent": 8,
+            "compaction_min_messages": 4,
+        }
+    enabled = c.enabled if enabled_override is None else enabled_override
+    return {
+        "compaction_enabled": enabled,
+        "compaction_trigger_tokens": c.trigger_tokens,
+        "compaction_keep_recent": c.keep_recent_messages,
+        "compaction_min_messages": c.min_messages_to_compact,
+    }
 
 
 def merge_cli_overrides(

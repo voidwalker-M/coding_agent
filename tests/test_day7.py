@@ -68,7 +68,7 @@ class TestCallWithRetry:
         agent = self._make_agent(backend)
 
         msgs = [LLMMessage(role="user", content="go")]
-        result = agent._call_with_retry(msgs, [])
+        result, _ttft = agent._call_with_retry(msgs, [])
         assert result.action.action_type == ActionType.FINISH
 
     def test_retries_on_network_error(self, tmp_path):
@@ -89,7 +89,7 @@ class TestCallWithRetry:
         agent = self._make_agent(backend, config)
 
         msgs = [LLMMessage(role="user", content="go")]
-        result = agent._call_with_retry(msgs, [])
+        result, _ttft = agent._call_with_retry(msgs, [])
         assert result.action.action_type == ActionType.FINISH
         assert call_count == 3
 

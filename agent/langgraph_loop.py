@@ -34,12 +34,13 @@ import logging
 import subprocess
 from typing import Any, Callable, Optional, TypedDict
 
-from agent.core import AgentConfig
+from agent.core import AgentConfig, _make_history_compactor
+from agent.decision import DecisionEngine, DecisionKind, is_clean_git_repo
 from agent.event_log import EventLog
+from agent.plan import Plan
 from agent.prompt import (
     build_system_prompt,
     build_task_prompt,
-    reflection_test_failed,
 )
 from agent.task import (
     Action, ActionType, RunResult, RunStatus, Task,
@@ -47,6 +48,7 @@ from agent.task import (
 from context.history import ConversationHistory
 from context.repo_map import RepoMap
 from context.token_budget import TokenBudget
+from context.workspace_sync import record_edit
 from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry, ToolResult
 
@@ -127,6 +129,10 @@ class AgentState(TypedDict, total=False):
     status: str            # "running" | "success" | "gave_up"
     summary: str
     last_action: Action
+    noop_finish_rejections: int
+    verified_since_edit: bool
+    located: bool
+    retry_agent: bool
 
 
 # ---------------------------------------------------------------------------
@@ -149,12 +155,19 @@ class LangGraphAgent:
         self._backend = backend
         self._registry = registry
         self._cfg = config or AgentConfig()
+        self._compactor = _make_history_compactor(self._backend, self._cfg)
+        self._decision = DecisionEngine.from_config(self._cfg)
+        plan_tool = self._registry.get_tool("plan")
+        self._plan: Plan = getattr(plan_tool, "plan", None) or Plan()
         # Wrap as LangChain tools; fall back to direct registry use if wrapping fails
         try:
             self._lc_tools = to_langchain_tools(registry)
         except Exception as exc:  # langchain missing or schema error
             logger.warning("LangChain tool wrapping failed (%s); using registry directly", exc)
             self._lc_tools = {}
+        self._dirty_paths: set[str] = set()
+        self._repo_summary = ""
+        self._rag_context = ""
 
     # ------------------------------------------------------------------
     # Public interface
@@ -174,11 +187,26 @@ class LangGraphAgent:
         # Build context (system prompt: repo-map + optional RAG)
         repo_map = RepoMap(task.repo_path)
         token_budget = TokenBudget(total=self._cfg.budget_tokens)
-        repo_summary = repo_map.build(
+        self._live_repo_map = repo_map
+        self._live_token_budget = token_budget
+        self._live_task = task
+        self._repo_summary = repo_map.build(
             budget=token_budget.default_plan().repo_map,
             query=task.description or None,
         )
-        rag_context = self._build_rag_context(task.description)
+        self._rag_context = self._build_rag_context(task.description)
+        try:
+            from context.rules import load_project_rules
+            rules_context = load_project_rules(task.repo_path)
+        except Exception:
+            rules_context = ""
+        try:
+            from context.skills import load_skills_prompt
+            skills_context = load_skills_prompt(task.repo_path)
+        except Exception:
+            skills_context = ""
+        if skills_context:
+            rules_context = "\n\n".join(p for p in (rules_context, skills_context) if p)
         schemas = self._registry.get_schemas()
 
         # Initialize conversation history
@@ -193,9 +221,14 @@ class LangGraphAgent:
         # ── node: agent ─────────────────────────────────────────────────
         def agent_node(state: AgentState) -> dict:
             step = state["step"] + 1
+            compact_tokens = 0
+            if self._compactor is not None:
+                cr = self._compactor.maybe_compact(state["history"])
+                compact_tokens = cr.input_tokens + cr.output_tokens
+            self._flush_dirty_indexes()
             messages = self._build_messages(
                 state["history"], token_budget, schemas,
-                task.repo_path, repo_summary, rag_context,
+                task.repo_path, self._repo_summary, self._rag_context, rules_context,
             )
             response = self._backend.complete(messages, schemas)
             action = response.action
@@ -204,9 +237,45 @@ class LangGraphAgent:
 
             updates: dict = {
                 "step": step,
-                "total_tokens": state["total_tokens"] + response.total_tokens,
+                "total_tokens": state["total_tokens"] + response.total_tokens + compact_tokens,
                 "last_action": action,
+                "retry_agent": False,
             }
+
+            need_git = action.action_type == ActionType.FINISH and (
+                self._cfg.require_edit_before_finish
+                or self._cfg.require_test_before_finish
+            )
+            git_clean = need_git and is_clean_git_repo(task.repo_path)
+            decision = self._decision.after_action(
+                action, log, git_clean=git_clean,
+                noop_finish_rejections=state.get("noop_finish_rejections", 0),
+                verified_since_edit=state.get("verified_since_edit", True),
+                located=state.get(
+                    "located", not self._cfg.require_locate_before_edit
+                ),
+            )
+            if decision.kind in (DecisionKind.ABORT_LOOP, DecisionKind.ABORT_NOOP_FINISH):
+                log.log_task_failed(steps=step, reason=decision.reason)
+                updates["status"] = "gave_up"
+                updates["summary"] = decision.reason
+                return updates
+            if decision.kind in (DecisionKind.REJECT_FINISH, DecisionKind.REJECT_ACTION):
+                history = state["history"]
+                if decision.kind == DecisionKind.REJECT_FINISH:
+                    history.add(LLMMessage(role="assistant", content=action.message or "(finish)"))
+                else:
+                    history.add(LLMMessage(role="assistant", content=self._fmt_action(action)))
+                history.add(LLMMessage(role="user", content=decision.prompt))
+                log.log_reflection(step=step, reason=decision.reason, prompt=decision.prompt)
+                updates["history"] = history
+                if decision.reason == "noop_finish":
+                    updates["noop_finish_rejections"] = (
+                        state.get("noop_finish_rejections", 0) + 1
+                    )
+                updates["retry_agent"] = True
+                return updates
+
             if action.action_type == ActionType.FINISH:
                 summary = action.message or "Task complete."
                 log.log_task_complete(steps=step, summary=summary)
@@ -228,20 +297,38 @@ class LangGraphAgent:
             result = self._execute_tool(tc.name, tc.params)
             observation = result.to_observation(tc.name)
             log.log_observation(step=state["step"], observation=observation)
+            record_edit(
+                self._dirty_paths, tc.name, tc.params,
+                succeeded=observation.is_success(),
+            )
 
             history.add(LLMMessage(role="assistant", content=self._fmt_action(action)))
             history.add(LLMMessage(role="user", content=self._fmt_obs(observation)))
 
-            swe = state.get("steps_without_edit", 0)
-            swe = 0 if tc.name in ("file_write", "file_edit", "edit") else swe + 1
+            swe = self._decision.next_steps_without_edit(
+                tc.name, state.get("steps_without_edit", 0)
+            )
+            verified = self._decision.next_verified_since_edit(
+                tc.name, observation, state.get("verified_since_edit", True)
+            )
+            located = self._decision.next_located(
+                tc.name, observation,
+                state.get("located", not self._cfg.require_locate_before_edit),
+            )
 
-            # Reflection: inject a reflection prompt when tests fail
-            if tc.name in self._cfg.test_tool_names and not observation.is_success():
-                prompt = reflection_test_failed()
-                log.log_reflection(step=state["step"], reason="test_failed", prompt=prompt)
-                history.add(LLMMessage(role="user", content=prompt))
+            reflect = self._decision.after_observation(tc.name, observation, swe)
+            if reflect.kind in (DecisionKind.REFLECT_TEST_FAILED, DecisionKind.REFLECT_NO_EDIT):
+                log.log_reflection(step=state["step"], reason=reflect.reason, prompt=reflect.prompt)
+                history.add(LLMMessage(role="user", content=reflect.prompt))
+                if reflect.kind == DecisionKind.REFLECT_NO_EDIT:
+                    swe = 0
 
-            return {"steps_without_edit": swe, "history": history}
+            return {
+                "steps_without_edit": swe,
+                "verified_since_edit": verified,
+                "located": located,
+                "history": history,
+            }
 
         # ── routing ──────────────────────────────────────────────────────
         def route_after_agent(state: AgentState) -> str:
@@ -249,6 +336,8 @@ class LangGraphAgent:
                 return "end"
             if state["step"] >= max_steps:
                 return "end"
+            if state.get("retry_agent"):
+                return "retry"
             action = state["last_action"]
             if action.action_type == ActionType.TOOL_CALL and action.tool_call:
                 return "tools"
@@ -259,7 +348,10 @@ class LangGraphAgent:
         graph.add_node("agent", agent_node)
         graph.add_node("tools", tool_node)
         graph.set_entry_point("agent")
-        graph.add_conditional_edges("agent", route_after_agent, {"tools": "tools", "end": END})
+        graph.add_conditional_edges(
+            "agent", route_after_agent,
+            {"tools": "tools", "retry": "agent", "end": END},
+        )
         graph.add_edge("tools", "agent")
         app = graph.compile()
 
@@ -268,6 +360,9 @@ class LangGraphAgent:
             "step": 0,
             "total_tokens": 0,
             "steps_without_edit": 0,
+            "noop_finish_rejections": 0,
+            "verified_since_edit": True,
+            "located": not self._cfg.require_locate_before_edit,
             "status": "running",
             "summary": "",
         }
@@ -310,14 +405,46 @@ class LangGraphAgent:
             logger.warning("RAG retrieval failed: %s", exc)
             return ""
 
+    def _flush_dirty_indexes(self) -> None:
+        if not self._dirty_paths:
+            return
+        retriever = getattr(self._cfg, "retriever", None)
+        if retriever is not None and hasattr(retriever, "build"):
+            try:
+                retriever.build()
+            except Exception as exc:
+                logger.warning("RAG rebuild after edits failed: %s", exc)
+        tool = self._registry.get_tool("find_symbol")
+        index = getattr(tool, "_index", None) if tool is not None else None
+        if index is not None and hasattr(index, "build"):
+            try:
+                index.build()
+            except Exception as exc:
+                logger.warning("Symbol index rebuild after edits failed: %s", exc)
+        task = getattr(self, "_live_task", None)
+        repo_map = getattr(self, "_live_repo_map", None)
+        token_budget = getattr(self, "_live_token_budget", None)
+        if repo_map is not None and token_budget is not None:
+            self._repo_summary = repo_map.build(
+                budget=token_budget.default_plan().repo_map,
+                query=(task.description if task is not None else None),
+            )
+        if task is not None:
+            self._rag_context = self._build_rag_context(task.description)
+        logger.info("LangGraph refreshed indexes after edits to %s", sorted(self._dirty_paths))
+        self._dirty_paths.clear()
+
     def _build_messages(
         self, history, token_budget, schemas, repo_path, repo_summary, rag_context,
+        rules_context: str = "",
     ) -> list[LLMMessage]:
         system_content = build_system_prompt(
             repo_path=repo_path,
             tools=schemas,
             repo_summary=repo_summary,
             retrieved_context=rag_context or None,
+            rules_context=rules_context or None,
+            plan_context=(self._plan.render_for_prompt() or None),
         )
         trimmed = token_budget.trim_history(
             history.to_dicts(), token_budget.default_plan().history

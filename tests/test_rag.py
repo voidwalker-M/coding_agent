@@ -15,8 +15,11 @@ Covers:
 
 from pathlib import Path
 
-import numpy as np
 import pytest
+
+pytest.importorskip("numpy")
+
+import numpy as np
 
 from agent.core import Agent, AgentConfig
 from agent.event_log import EventLog

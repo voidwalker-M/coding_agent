@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package agent;
+
+import "google/protobuf/struct.proto";
+
+service AgentService {
+  rpc Health(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc SubmitTask(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc GetTaskStatus(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc ResumeTask(google.protobuf.Struct) returns (google.protobuf.Struct);
+}

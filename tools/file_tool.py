@@ -20,12 +20,19 @@ from pathlib import Path
 from typing import Any
 
 from tools.base import BaseTool, ToolResult
+from tools.path_policy import TEST_EDIT_BLOCKED_MSG, is_test_path
 
 
 # Maximum lines returned by a single file_read; beyond this, suggest file_view
 MAX_READ_LINES = 500
 # Lines per window for file_view
 VIEW_WINDOW_LINES = 100
+
+
+def _reject_test_edit(path: Path) -> ToolResult | None:
+    if is_test_path(path):
+        return ToolResult(success=False, output="", error=TEST_EDIT_BLOCKED_MSG)
+    return None
 
 
 class FileReadTool(BaseTool):
@@ -189,9 +196,15 @@ class FileWriteTool(BaseTool):
         content (str): content to write
     """
 
-    def __init__(self, undo_manager: "UndoManager | None" = None) -> None:
+    def __init__(
+        self,
+        undo_manager: "UndoManager | None" = None,
+        *,
+        block_test_edits: bool = False,
+    ) -> None:
         from tools.undo_tool import UndoManager
         self._undo = undo_manager or UndoManager()
+        self._block_test_edits = block_test_edits
 
     @property
     def name(self) -> str:
@@ -199,11 +212,16 @@ class FileWriteTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return (
+        base = (
             "Write content to a file, replacing its entire contents. "
             "Parent directories are created automatically. "
             "Always read the file first before writing to avoid losing existing content."
         )
+        if self._block_test_edits:
+            base += (
+                " Do NOT write under tests/ or to test_*.py — fix library code only."
+            )
+        return base
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
@@ -225,6 +243,10 @@ class FileWriteTool(BaseTool):
     def execute(self, params: dict[str, Any]) -> ToolResult:
         path = Path(params.get("path", ""))
         content = params.get("content", "")
+        if self._block_test_edits:
+            blocked = _reject_test_edit(path)
+            if blocked is not None:
+                return blocked
 
         self._undo.snapshot_from_disk("file_write", str(path))
         try:
@@ -255,9 +277,15 @@ class FileEditTool(BaseTool):
         new_string (str): text to replace it with
     """
 
-    def __init__(self, undo_manager: "UndoManager | None" = None) -> None:
+    def __init__(
+        self,
+        undo_manager: "UndoManager | None" = None,
+        *,
+        block_test_edits: bool = False,
+    ) -> None:
         from tools.undo_tool import UndoManager
         self._undo = undo_manager or UndoManager()
+        self._block_test_edits = block_test_edits
 
     @property
     def name(self) -> str:
@@ -265,7 +293,7 @@ class FileEditTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return (
+        base = (
             "Replace an exact string in an existing file with new text. PREFER THIS "
             "over file_write for modifying existing files — you only provide the "
             "snippet to change, not the whole file. `old_string` must match the file "
@@ -273,6 +301,11 @@ class FileEditTool(BaseTool):
             "and must be unique; include a few extra lines of context if needed to "
             "make it unique. Read the file first to get the exact text."
         )
+        if self._block_test_edits:
+            base += (
+                " Do NOT edit under tests/ or test_*.py — fix library code only."
+            )
+        return base
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
@@ -300,6 +333,10 @@ class FileEditTool(BaseTool):
         old_string = params.get("old_string", "")
         new_string = params.get("new_string", "")
 
+        if self._block_test_edits:
+            blocked = _reject_test_edit(path)
+            if blocked is not None:
+                return blocked
         if not path or not str(path):
             return ToolResult(success=False, output="", error="path is required")
         if not old_string:

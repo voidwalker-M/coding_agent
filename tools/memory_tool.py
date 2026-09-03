@@ -37,10 +37,10 @@ class RememberTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Save a durable memory for future sessions — a repo convention, a "
-            "user preference, or a hard-won insight worth not rediscovering. "
-            "Use sparingly for facts that will still matter next time; do NOT "
-            "use it as a scratchpad for the current task."
+            "Save a durable *fact* for future sessions (Cursor Memories-style): "
+            "a repo convention, user preference, or hard-won insight. "
+            "Project/reference facts are public to this repo; user prefs stay private. "
+            "Do NOT dump the current task transcript — use sparingly."
         )
 
     @property
@@ -58,6 +58,16 @@ class RememberTool(BaseTool):
                 "description": {"type": "string", "description": "Optional one-line summary for the memory index."},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional topic tags."},
                 "files": {"type": "array", "items": {"type": "string"}, "description": "Optional related file paths."},
+                "scope": {
+                    "type": "string",
+                    "enum": ["user", "conversation", "global"],
+                    "description": "user=this user only, conversation=this dialogue, global=all users (agent/admin).",
+                },
+                "visibility": {
+                    "type": "string",
+                    "enum": ["private", "shared", "public"],
+                    "description": "private=owner only, shared=ACL grants, public=anyone.",
+                },
             },
             "required": ["text"],
         }
@@ -77,6 +87,10 @@ class RememberTool(BaseTool):
                 tags=list(params.get("tags") or []),
                 files=list(params.get("files") or []),
                 source="agent",
+                scope=params.get("scope") or "user",
+                visibility=params.get("visibility") or (
+                    "private" if kind == "user" else "public"
+                ),
             )
         except Exception as exc:                       # never break the agent loop
             return ToolResult(success=False, output="", error=f"memory write failed: {exc}")

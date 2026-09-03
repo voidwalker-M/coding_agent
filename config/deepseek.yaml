@@ -1,0 +1,26 @@
+# DeepSeek — use with:
+#   agent chat -c config/deepseek.yaml
+#   docker run ... coding-agent -c /opt/coding-agent/config/deepseek.yaml chat --repo /workspace
+
+llm:
+  provider: deepseek
+  model: deepseek-chat          # or deepseek-v4-flash / deepseek-v4-pro if available
+  api_key: ${DEEPSEEK_API_KEY}
+  base_url: https://api.deepseek.com
+  max_tokens: 4096
+
+agent:
+  max_steps: 40
+  budget_tokens: 80000
+  log_dir: ./logs
+
+tools:
+  shell:
+    timeout: 30
+    max_output_tokens: 8000
+  file:
+    max_view_lines: 100
+
+context:
+  repo_map_budget: 8000
+  history_window: 20

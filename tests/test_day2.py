@@ -331,6 +331,26 @@ class TestLoopDetection:
         assert "Loop detected" in result.summary
         log.close()
 
+    def test_plan_tool_injected_into_next_prompt(self, tmp_path):
+        from tools.plan_tool import PlanTool
+        task = Task(description="plan then finish", repo_path=str(tmp_path), max_steps=5)
+        log = EventLog.create(task, log_dir=str(tmp_path / "logs"))
+        script = [
+            Action(ActionType.TOOL_CALL, "plan",
+                   tool_call=ToolCall("plan", {"action": "create", "steps": ["edit calc", "run tests"]})),
+            Action(ActionType.FINISH, "done", message="ok"),
+        ]
+        backend = MockBackend(script)
+        registry = ToolRegistry().register(PlanTool())
+        result = Agent(backend, registry, AgentConfig(max_steps=5)).run(task, log)
+        assert result.status == RunStatus.SUCCESS
+        # Second complete() sees the plan in the system prompt
+        assert len(backend.received_messages) >= 2
+        sys_msg = backend.received_messages[1][0].content
+        assert "## Current plan" in sys_msg
+        assert "edit calc" in sys_msg
+        log.close()
+
     def test_different_actions_not_detected_as_loop(self, task, log, registry):
         """Alternating different actions should not trigger loop detection."""
         script = [

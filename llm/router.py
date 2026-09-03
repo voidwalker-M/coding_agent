@@ -9,6 +9,7 @@ Supported providers:
     deepseek   → OpenAICompatBackend (base_url=https://api.deepseek.com)
     groq       → OpenAICompatBackend (base_url=https://api.groq.com/openai/v1)
     ollama     → OpenAICompatBackend (base_url=http://localhost:11434/v1)
+    vllm       → OpenAICompatBackend (base_url=http://localhost:8000/v1)
 
 To add a new provider, add one entry to _PROVIDER_BASE_URLS.
 """
@@ -26,6 +27,7 @@ _PROVIDER_BASE_URLS: dict[str, str | None] = {
     "deepseek":  "https://api.deepseek.com",
     "groq":      "https://api.groq.com/openai/v1",
     "ollama":    "http://localhost:11434/v1",
+    "vllm":      "http://localhost:8000/v1",
 }
 
 # provider → environment variable name (fallback when api_key is not configured)
@@ -35,6 +37,7 @@ _ENV_KEY_MAP: dict[str, str] = {
     "deepseek":  "DEEPSEEK_API_KEY",
     "groq":      "GROQ_API_KEY",
     "ollama":    "OLLAMA_API_KEY",   # Ollama local server typically doesn't need one; leave empty
+    "vllm":      "VLLM_API_KEY",     # vLLM OpenAI-compat server; leave empty for local
 }
 
 
@@ -50,7 +53,7 @@ def create_backend(
     Factory function that creates the appropriate LLMBackend for a given provider.
 
     Args:
-        provider:   "anthropic" | "openai" | "deepseek" | "groq" | "ollama"
+        provider:   "anthropic" | "openai" | "deepseek" | "groq" | "ollama" | "vllm"
         model:      model name, e.g. "claude-sonnet-4-5", "gpt-4o", "deepseek-chat"
         api_key:    API key; read from environment variable when None
         base_url:   override the default base_url (usually not needed)
@@ -72,7 +75,7 @@ def create_backend(
 
     # Resolve api_key
     resolved_key = api_key or os.environ.get(_ENV_KEY_MAP.get(provider, ""), "")
-    if not resolved_key and provider != "ollama":
+    if not resolved_key and provider not in ("ollama", "vllm"):
         env_var = _ENV_KEY_MAP.get(provider, "")
         raise ValueError(
             f"API key for '{provider}' not provided. "
@@ -80,7 +83,7 @@ def create_backend(
         )
     # Ollama local server doesn't need a real key; use a placeholder
     if not resolved_key:
-        resolved_key = "ollama"
+        resolved_key = provider  # local servers don't need a real key
 
     if provider == "anthropic":
         from llm.anthropic_backend import AnthropicBackend

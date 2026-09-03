@@ -34,12 +34,8 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from config.schema import load_config, merge_cli_overrides   # noqa: E402
+from config.schema import load_config, merge_cli_overrides, agent_compaction_kwargs  # noqa: E402
 from llm.router import create_backend_from_config            # noqa: E402
-
-# Module-level imports (for patching in tests)
-from config.schema import load_config, merge_cli_overrides  # noqa: E402
-from llm.router import create_backend_from_config           # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +79,8 @@ def _setup_logging(verbose: bool, log_file: "Path | None" = None,
 
 
 def _build_registry(cfg, confirm_callback=None, runtime=None, memory=None, symbol_index=None,
-                    undo_manager=None):
+                    undo_manager=None, repo_path: str = ".",
+                    block_test_edits: bool = False):
     """Assemble the tool registry from configuration.
 
     memory:       a LongTermMemory instance; when given, the remember/recall tools
@@ -92,6 +89,8 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory=None, symbo
                   (O(1) indexed lookup) instead of re-scanning the repo per call.
     undo_manager: shared UndoManager backing file snapshots and the undo tool.
                   Defaults to an in-memory-only one (no sidecar file on disk).
+    repo_path:    used by SkillTool to discover `.agent/skills/*/SKILL.md`.
+    block_test_edits: when True, file_write/file_edit refuse tests/ paths (SWE-bench).
     """
     from tools.base import ToolRegistry
     from tools.file_tool import FileEditTool, FileReadTool, FileViewTool, FileWriteTool
@@ -109,8 +108,8 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory=None, symbo
         .register(ShellTool(confirm_callback=confirm_callback, runtime=runtime))
         .register(FileReadTool())
         .register(FileViewTool())
-        .register(FileWriteTool(undo_manager=undo_manager))
-        .register(FileEditTool(undo_manager=undo_manager))
+        .register(FileWriteTool(undo_manager=undo_manager, block_test_edits=block_test_edits))
+        .register(FileEditTool(undo_manager=undo_manager, block_test_edits=block_test_edits))
         .register(UndoTool(undo_manager))
         .register(SearchTextTool())
         .register(FindFilesTool())
@@ -121,6 +120,12 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory=None, symbo
         .register(GitAddTool(runtime=runtime))
         .register(GitCommitTool(runtime=runtime))
     )
+    from tools.plan_tool import PlanTool
+    from tools.skill_tool import SkillTool
+    from tools.browser_tool import WebFetchTool
+    registry.register(PlanTool())
+    registry.register(SkillTool(repo_path=repo_path))
+    registry.register(WebFetchTool())
     if memory is not None:
         from tools.memory_tool import RecallTool, RememberTool
         registry.register(RememberTool(memory)).register(RecallTool(memory))
@@ -145,25 +150,41 @@ def _build_symbol_index(repo_path: str):
 def _build_memory(repo_path: str, cfg, *, enable: bool):
     """Build a LongTermMemory when memory is enabled (config or --memory), else None.
 
-    Stores markdown records + a MEMORY.md index under `memory.dir` (default
-    <repo>/.agent_memory). Uses the RAG embedding backend for dense recall when
-    numpy is available; otherwise degrades to the built-in lexical engine.
+    Stores SQLite (`memory.db`) + a markdown cache/index under `memory.dir`
+    (default <repo>/.agent_memory). Recall is filtered by the configured user/role.
+    Uses the RAG embedding backend for dense recall when numpy is available;
+    otherwise degrades to the built-in lexical engine.
     """
-    if not enable:
+    from context.store_factory import memory_wanted, open_memory_store
+    if not enable and not memory_wanted():
         return None
     from pathlib import Path as _Path
     from context.memory import LongTermMemory
 
     mem_dir = cfg.memory.dir or str(_Path(repo_path) / ".agent_memory")
+    store = open_memory_store(_Path(mem_dir) / "memory.db")
     embeddings = None
-    try:                                    # optional dense recall (needs numpy)
-        import numpy  # noqa: F401
+    try:
         from context.rag import create_embedding_backend
-        embeddings = create_embedding_backend()
+        embeddings = create_embedding_backend()  # OpenAI if keyed, else hashing (offline)
     except Exception:
         embeddings = None
+    from context.auth import load_session
+    sess = load_session()
+    if sess:
+        user_id = sess["user_id"]
+        role = sess.get("role") or "user"
+    else:
+        user_id = getattr(cfg.memory, "default_user", "default")
+        role = getattr(cfg.memory, "default_role", "agent")
     return LongTermMemory(
-        mem_dir, embeddings=embeddings, max_records=cfg.memory.max_records
+        mem_dir,
+        embeddings=embeddings,
+        max_records=cfg.memory.max_records,
+        user_id=user_id,
+        role=role,
+        auto_approve=getattr(cfg.memory, "auto_approve", True),
+        store=store,
     ).load()
 
 
@@ -262,6 +283,93 @@ def cli(ctx: click.Context, config: str | None) -> None:
     ctx.obj["config_path"] = config
 
 
+def _open_user_store(ctx: click.Context, repo: str):
+    """Same memory store chat/run use, so registered users own LTM/STM there."""
+    from context.store_factory import open_memory_store
+
+    config = load_config(ctx.obj.get("config_path"))
+    repo_path = Path(repo).resolve()
+    mem_dir = config.memory.dir or str(repo_path / ".agent_memory")
+    return open_memory_store(Path(mem_dir) / "memory.db")
+
+
+# ---------------------------------------------------------------------------
+# register / login / logout / whoami
+# ---------------------------------------------------------------------------
+
+@cli.command("register")
+@click.option("--username", "-u", prompt=True, help="Login name (becomes memory user_id)")
+@click.option(
+    "--password", "-p",
+    prompt=True, hide_input=True, confirmation_prompt=True,
+    help="Password (hidden; not stored in plaintext)",
+)
+@click.option("--repo", "-r", default=".", show_default=True)
+@click.pass_context
+def register_cmd(ctx: click.Context, username: str, password: str, repo: str) -> None:
+    """Create a local user. Password is stored as PBKDF2-SHA256."""
+    from context.auth import AuthError, register_user, save_session
+
+    store = _open_user_store(ctx, repo)
+    try:
+        user = register_user(store, username, password)
+    except AuthError as exc:
+        click.echo(red(f"Error: {exc}"), err=True)
+        sys.exit(1)
+    finally:
+        store.close()
+    save_session(user.id, user.role)
+    click.echo(green(f"Registered and logged in as {user.id}"))
+    click.echo(dim("  Memory for chat/run --memory will use this user_id."))
+
+
+@cli.command("login")
+@click.option("--username", "-u", prompt=True)
+@click.option("--password", "-p", prompt=True, hide_input=True)
+@click.option("--repo", "-r", default=".", show_default=True)
+@click.pass_context
+def login_cmd(ctx: click.Context, username: str, password: str, repo: str) -> None:
+    """Log in; later commands use this user_id for memory."""
+    from context.auth import AuthError, authenticate, save_session
+
+    store = _open_user_store(ctx, repo)
+    try:
+        user = authenticate(store, username, password)
+    except AuthError as exc:
+        click.echo(red(f"Error: {exc}"), err=True)
+        sys.exit(1)
+    finally:
+        store.close()
+    save_session(user.id, user.role)
+    click.echo(green(f"Logged in as {user.id}"))
+
+
+@cli.command("logout")
+def logout_cmd() -> None:
+    """Clear the local login session."""
+    from context.auth import clear_session, load_session
+
+    sess = load_session()
+    clear_session()
+    if sess:
+        click.echo(f"Logged out {sess['user_id']}")
+    else:
+        click.echo("Not logged in")
+
+
+@cli.command("whoami")
+def whoami_cmd() -> None:
+    """Show the currently logged-in user."""
+    from context.auth import load_session, session_path
+
+    sess = load_session()
+    if not sess:
+        click.echo("Not logged in (memory user_id = config default, usually 'default')")
+        return
+    click.echo(f"{sess['user_id']}  role={sess['role']}")
+    click.echo(dim(f"  session: {session_path()}"))
+
+
 # ---------------------------------------------------------------------------
 # run subcommand
 # ---------------------------------------------------------------------------
@@ -281,6 +389,7 @@ def cli(ctx: click.Context, config: str | None) -> None:
 @click.option("--rag-extra", multiple=True, type=click.Path(), help="External dir/file to index with RAG (docs, dependency source). Repeatable. Implies --retriever rag")
 @click.option("--memory", is_flag=True, default=False, help="Enable persistent long-term memory (markdown store + recall/remember tools)")
 @click.option("--memory-dir", default=None, type=click.Path(), help="Directory for long-term memory (default: <repo>/.agent_memory)")
+@click.option("--compact", is_flag=True, default=False, help="Enable LLM history compaction when conversation exceeds trigger_tokens")
 @click.option("--engine", "-e", type=click.Choice(["native", "langgraph"]), default="native", show_default=True, help="Orchestration engine: 'langgraph' runs the LangGraph port")
 @click.option("--cache", is_flag=True, default=False, help="Cache LLM responses (saves tokens on repeated/identical calls)")
 @click.option("--cheap-model", default=None, help="Enable cost-aware routing: cheapest tier model")
@@ -307,6 +416,7 @@ def run(
     rag_extra: tuple,
     memory: bool,
     memory_dir: str | None,
+    compact: bool,
     engine: str,
     cache: bool,
     cheap_model: str | None,
@@ -415,10 +525,20 @@ def run(
         click.echo(dim(f"  Retriever: RAG ({rag_retriever.chunk_count} chunks, {rag_retriever.backend_info})"))
         if rag_extra:
             click.echo(dim(f"  RAG external: {', '.join(rag_extra)}"))
+    if config.context.compaction.enabled or compact:
+        click.echo(dim(
+            f"  Compaction: on (trigger {config.context.compaction.trigger_tokens:,} tokens, "
+            f"keep recent {config.context.compaction.keep_recent_messages})"
+        ))
     # Long-term memory (#2): enabled by --memory or config; --memory-dir overrides.
     if memory_dir:
         config.memory.dir = memory_dir
     memory_on = memory or config.memory.enabled
+    from context.auth import load_session
+    sess = load_session()
+    if sess:
+        memory_on = True
+        click.echo(dim(f"  User: {sess['user_id']} (logged in)"))
     long_term = _build_memory(str(repo_path), config, enable=memory_on)
     if long_term is not None:
         click.echo(dim(f"  Memory: long-term on ({long_term.count} records, {long_term.backend_info})"))
@@ -433,7 +553,7 @@ def run(
     undo_manager = UndoManager(sidecar_path=log_dir_path / f"{stem}.undo.jsonl")
     registry = _build_registry(config, confirm_callback=confirm_cb, runtime=runtime,
                                memory=long_term, symbol_index=symbol_index,
-                               undo_manager=undo_manager)
+                               undo_manager=undo_manager, repo_path=str(repo_path))
 
     from agent.core import Agent, AgentConfig
     from agent.event_log import EventLog, summarize_run
@@ -466,7 +586,9 @@ def run(
         retriever=rag_retriever,
         long_term_memory=long_term,
         memory_top_k=config.memory.top_k,
+        memory_window_queries=config.memory.window_queries,
         capture_episodes=config.memory.capture_episodes,
+        **agent_compaction_kwargs(config.context, enabled_override=(config.context.compaction.enabled or compact)),
     )
     if engine == "langgraph":
         from agent.langgraph_loop import LangGraphAgent
@@ -566,7 +688,26 @@ def chat(
 
     from tools.undo_tool import UndoManager
     undo_manager = UndoManager(sidecar_path=log_dir_path / f"{session_stem}.undo.jsonl")
-    registry = _build_registry(config, undo_manager=undo_manager)
+    from context.auth import load_session
+    from context.memory import ShortTermMemory
+
+    sess = load_session()
+    memory_on = bool(sess) or config.memory.enabled
+    long_term = _build_memory(str(repo_path), config, enable=memory_on)
+    stm = None
+    if long_term is not None:
+        user_id = (sess or {}).get("user_id") or getattr(config.memory, "default_user", "default")
+        conv_id = long_term.new_conversation(title="chat")
+        stm = ShortTermMemory(
+            window_queries=getattr(config.memory, "window_queries", 10),
+            store=long_term.store,
+            user_id=user_id,
+            conversation_id=conv_id,
+            on_overflow=long_term.ingest_overflow,
+        )
+    registry = _build_registry(
+        config, undo_manager=undo_manager, repo_path=str(repo_path), memory=long_term,
+    )
     from tools.shell_tool import terminal_confirm
     from tools.runtime import create_runtime
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
@@ -579,6 +720,8 @@ def chat(
         repo_path=str(repo_path),
         log_dir=config.agent.log_dir,
         confirm_callback=terminal_confirm,   # confirmation enabled by default in chat mode
+        short_term_memory=stm,
+        long_term_memory=long_term,
     )
 
     # Welcome message
@@ -586,6 +729,10 @@ def chat(
     click.echo(f"  Provider : {config.llm.provider}")
     click.echo(f"  Model    : {config.llm.model}")
     click.echo(f"  Repo     : {repo_path}")
+    if sess:
+        click.echo(f"  User     : {sess['user_id']}")
+    elif long_term is not None:
+        click.echo(dim(f"  User     : {long_term.user_id} (not logged in)"))
     click.echo(dim(f"  Type your task. Commands: /exit /stats /clear /help\n"))
 
     # Enable line editing: backspace, arrow keys, Ctrl+A/E, history (↑↓)
@@ -714,9 +861,29 @@ def web(
         click.echo(red(f"Error: {e}"), err=True)
         sys.exit(1)
 
-    registry = _build_registry(config)
+    from context.auth import load_session
+    from context.memory import ShortTermMemory
+
+    sess = load_session()
+    memory_on = bool(sess) or config.memory.enabled
+    long_term = _build_memory(str(repo_path), config, enable=memory_on)
+    stm = None
+    if long_term is not None:
+        user_id = (sess or {}).get("user_id") or getattr(config.memory, "default_user", "default")
+        conv_id = long_term.new_conversation(title="web")
+        stm = ShortTermMemory(
+            window_queries=getattr(config.memory, "window_queries", 10),
+            store=long_term.store,
+            user_id=user_id,
+            conversation_id=conv_id,
+            on_overflow=long_term.ingest_overflow,
+        )
+    registry = _build_registry(config, repo_path=str(repo_path), memory=long_term)
     from entry.web import ChatWebApp, serve
-    app = ChatWebApp(backend, registry, config, str(repo_path), config.agent.log_dir)
+    app = ChatWebApp(
+        backend, registry, config, str(repo_path), config.agent.log_dir,
+        short_term_memory=stm, long_term_memory=long_term,
+    )
 
     click.echo(bold(f"\n🌐 Coding Agent — Web Chat"))
     click.echo(f"  Provider : {config.llm.provider}")
@@ -725,6 +892,159 @@ def web(
     click.echo(green(f"  Open     : http://{host}:{port}\n"))
     click.echo(dim("  Ctrl+C to stop.\n"))
     serve(app, host=host, port=port)
+
+
+# ---------------------------------------------------------------------------
+# serve subcommand — FastAPI + optional gRPC
+# ---------------------------------------------------------------------------
+
+@cli.command("serve")
+@click.option("--repo", "-r", default=".", show_default=True, help="Default repo path for tasks")
+@click.option("--host", default="0.0.0.0", show_default=True, help="HTTP bind host")
+@click.option("--port", default=8766, show_default=True, type=int, help="HTTP bind port")
+@click.option("--grpc-port", default=0, show_default=True, type=int,
+              help="gRPC bind port (0 = disabled)")
+@click.option("--workers", default=4, show_default=True, type=int, help="Thread-pool workers")
+@click.option("--checkpoint-dir", default="./checkpoints", show_default=True,
+              help="Directory for resumable checkpoints")
+@click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
+@click.pass_context
+def serve_cmd(
+    ctx: click.Context,
+    repo: str,
+    host: str,
+    port: int,
+    grpc_port: int,
+    workers: int,
+    checkpoint_dir: str,
+    verbose: bool,
+) -> None:
+    """Serve the agent over FastAPI (REST) with optional gRPC."""
+    _setup_logging(verbose, verbose_level=logging.INFO)
+    config = load_config(ctx.obj.get("config_path"))
+    repo_path = Path(repo).resolve()
+    if not repo_path.exists():
+        click.echo(red(f"Error: repo path does not exist: {repo_path}"), err=True)
+        sys.exit(1)
+
+    try:
+        import uvicorn
+    except ImportError:
+        click.echo(red("Error: uvicorn not installed. Run: pip install 'coding-agent[server]'"), err=True)
+        sys.exit(1)
+
+    from context.store_factory import memory_wanted
+    from entry.api import app, configure_service
+    from entry.runtime import build_runtime
+    from llm.router import create_backend_from_config
+
+    backend = None
+    llm_note = f"{config.llm.provider}/{config.llm.model}"
+    try:
+        backend = create_backend_from_config({
+            "provider": config.llm.provider,
+            "model": config.llm.model,
+            "api_key": config.llm.api_key or None,
+            "base_url": config.llm.base_url or None,
+            "max_tokens": config.llm.max_tokens,
+        })
+    except ValueError as exc:
+        from llm.base import OfflineBackend
+        backend = OfflineBackend()
+        llm_note = f"offline ({exc})"
+
+    memory_on = config.memory.enabled or memory_wanted()
+    runtime = build_runtime(
+        config_path=ctx.obj.get("config_path"),
+        repo_path=str(repo_path),
+        backend=backend,
+        stream=True,
+        memory=memory_on,
+    )
+    configure_service(
+        repo_path=str(repo_path),
+        checkpoint_dir=checkpoint_dir,
+        log_dir=config.agent.log_dir,
+        workers=workers,
+        runtime=runtime,
+    )
+    click.echo(bold(f"Agent API listening on http://{host}:{port}"))
+    click.echo(dim(f"  repo={repo_path}  checkpoints={checkpoint_dir}  workers={workers}"))
+    click.echo(dim(f"  llm={llm_note}  memory={memory_on}"))
+
+    if grpc_port:
+        import threading
+        from entry.grpc_server import serve_grpc
+        threading.Thread(
+            target=serve_grpc, kwargs={"host": host, "port": grpc_port, "workers": workers},
+            daemon=True,
+        ).start()
+        click.echo(dim(f"  gRPC on {host}:{grpc_port}"))
+
+    uvicorn.run(app, host=host, port=port, log_level="info" if verbose else "warning")
+
+
+@cli.command("load-test")
+@click.option("--url", default="http://127.0.0.1:8766", show_default=True)
+@click.option("--concurrency", "-c", default=4, show_default=True, type=int)
+@click.option("--requests", "-n", default=20, show_default=True, type=int)
+@click.option("--repo", "-r", default=".", show_default=True)
+def load_test_cmd(url: str, concurrency: int, requests: int, repo: str) -> None:
+    """Run a simple concurrent load test against agent serve."""
+    import json
+    from entry.load_test import run_load_test
+    report = run_load_test(url, concurrency=concurrency, requests=requests, repo_path=repo)
+    click.echo(json.dumps(report, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# mcp subcommand — expose tools via Model Context Protocol
+# ---------------------------------------------------------------------------
+
+@cli.command("mcp")
+@click.option("--repo", "-r", default=".", show_default=True, help="Repository root path")
+@click.option(
+    "--transport", "-t", default="stdio",
+    type=click.Choice(["stdio", "http", "streamable-http"]),
+    show_default=True,
+    help="MCP transport (stdio for Claude Desktop / Cursor)",
+)
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", default=8767, show_default=True, type=int)
+@click.option("--include-writes", is_flag=True, help="Expose file_edit/file_write/pytest")
+@click.pass_context
+def mcp_cmd(
+    ctx: click.Context,
+    repo: str,
+    transport: str,
+    host: str,
+    port: int,
+    include_writes: bool,
+) -> None:
+    """Run the agent tool registry as an MCP server."""
+    import os
+    from pathlib import Path as _Path
+
+    repo_path = _Path(repo).resolve()
+    if not repo_path.exists():
+        click.echo(red(f"Error: repo path does not exist: {repo_path}"), err=True)
+        sys.exit(1)
+    os.chdir(repo_path)
+
+    from context.mcp_bridge import build_mcp_server, run_mcp_server_blocking
+    cfg = load_config(ctx.obj.get("config_path"))
+    symbol_index = _build_symbol_index(str(repo_path))
+    registry = _build_registry(cfg, symbol_index=symbol_index, repo_path=str(repo_path))
+    server = build_mcp_server(
+        registry, repo_path=str(repo_path), include_writes=include_writes,
+    )
+    names = [t.name for t in __import__("asyncio").run(server.list_tools())]
+    click.echo(dim(f"  MCP tools ({len(names)}): {', '.join(names)}"))
+    if transport == "stdio":
+        click.echo(dim("  Transport: stdio (ready for IDE MCP host)"))
+    else:
+        click.echo(dim(f"  Transport: {transport} on {host}:{port}"))
+    run_mcp_server_blocking(server, transport=transport, host=host, port=port)
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +1059,9 @@ def web(
 @click.option("--provider", "-p", default=None, help="Override LLM provider")
 @click.option("--max-steps", default=None, type=int, help="Max steps per role")
 @click.option("--iterations", "-i", default=2, show_default=True, type=int, help="Max coder/reviewer iterations")
+@click.option("--topology", type=click.Choice(["pipeline", "pair", "debate", "autonomous"]),
+              default="pipeline", show_default=True,
+              help="Multi-agent topology")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
@@ -751,10 +1074,11 @@ def multi(
     provider: str | None,
     max_steps: int | None,
     iterations: int,
+    topology: str,
     sandbox: bool,
     verbose: bool,
 ) -> None:
-    """Run the planner → coder → reviewer multi-agent pipeline on a task."""
+    """Run a multi-agent topology (pipeline / pair / debate / autonomous) on a task."""
     _setup_logging(verbose)
     config = load_config(ctx.obj.get("config_path"))
     config = merge_cli_overrides(config, provider=provider, model=model, max_steps=max_steps)
@@ -784,7 +1108,7 @@ def multi(
 
     from tools.runtime import create_runtime
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
-    registry = _build_registry(config, runtime=runtime)
+    registry = _build_registry(config, runtime=runtime, repo_path=str(repo_path))
 
     from agent.core import AgentConfig
     from agent.orchestrator import Orchestrator
@@ -792,7 +1116,7 @@ def multi(
 
     agent_cfg = AgentConfig(max_steps=config.agent.max_steps, budget_tokens=config.agent.budget_tokens)
 
-    click.echo(bold(f"\n🤝 Coding Agent — Multi-Agent (planner → coder → reviewer)"))
+    click.echo(bold(f"\n🤝 Coding Agent — Multi-Agent ({topology})"))
     click.echo(f"  Model    : {config.llm.model}   Iterations: {iterations}")
     click.echo(f"  Repo     : {repo_path}\n")
 
@@ -800,7 +1124,8 @@ def multi(
         click.echo(cyan(f"  ▶ {role}…"))
 
     orch = Orchestrator(backend, registry, agent_cfg,
-                        max_iterations=iterations, on_role_start=_on_role)
+                        max_iterations=iterations, on_role_start=_on_role,
+                        topology=topology)
     task_obj = Task(description=description, repo_path=str(repo_path),
                     max_steps=config.agent.max_steps)
     result = orch.run(task_obj, log_dir=config.agent.log_dir)
@@ -870,7 +1195,7 @@ def eval_cmd(
         sys.exit(1)
 
     def make_agent(spec, repo_path):
-        registry = _build_registry(config)
+        registry = _build_registry(config, repo_path=repo_path)
         rag = _build_retriever(repo_path, retriever)
         agent_cfg = AgentConfig(
             max_steps=spec.max_steps if max_steps is None else max_steps,

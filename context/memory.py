@@ -1,66 +1,18 @@
 """
 context/memory.py
 
-Two-tier agent memory (feature #2), modeled on how Claude Code itself does
-memory (see https://learn.shareai.run/en/s09/) and upgraded with a proper
-retrieval engine.
+Cursor / Claude Code-shaped memory for a coding agent:
 
-The agent already has a *sliding-window* conversation history (context/history.py)
-— raw working context that is lossy: when the window overflows the oldest turns
-are dropped outright. Memory is the layer that "keeps what compression throws
-away". Two tiers:
+  Project rules     — instructions *you* wrote (AGENTS.md, CLAUDE.md,
+                      .cursor/rules). Always-on, not this module. See rules.py.
+  ShortTermMemory   — the current conversation: last *n* user queries in
+                      process memory (the thread *is* STM; SQLite persist is optional).
+  LongTermMemory    — small durable *facts* (Memories). Explicit remember() is
+                      approved immediately. Auto-proposed notes can sit pending
+                      until approve(). Episodic run logs are stored but not
+                      stuffed into every prompt.
 
-  ShortTermMemory  — within-episode / session working memory. A small, bounded
-                     scratchpad the agent accumulates during one run: distilled
-                     notes, the files it has looked at, and a *rolling summary* of
-                     the turns history evicted (so nothing is silently lost across
-                     a window trim / auto-compaction). Rendered into the prompt and
-                     discarded at the end of the run.
-
-  LongTermMemory   — persistent memory across sessions, on disk. This mirrors
-                     Claude Code's user-memory design:
-                       * one Markdown file **per memory** with YAML frontmatter,
-                         under `<mem_dir>/` — human-readable and hand-editable;
-                       * a single **MEMORY.md index** (one line per memory) that is
-                         cheap and stable, so it lives in the SYSTEM prompt and
-                         stays prompt-cache friendly;
-                       * memory **content injected on demand** — only the handful of
-                         records relevant to the current task are pulled in full,
-                         capped per file, so the catalog stays cheap.
-                     Typed like Claude Code — user / feedback / project / reference
-                     — plus `episodic` (a captured past run) and `semantic` (a
-                     free fact).
-
-## Retrieval (two paths, as in the reference — upgraded)
-
-  1. Index path — `index_block()` returns the MEMORY.md catalog for the system
-     prompt (always present, cache-stable).
-  2. On-demand path — `select(query, k)` ranks records and returns the top few,
-     whose bodies `recall()` injects. Ranking is a real engine, not just keyword
-     match: an inverted index + idf lexical score, recency **decay** + **importance**
-     weighting, optional **dense** embeddings fused via reciprocal-rank-fusion, and
-     an optional pluggable **LLM selector** side-query (`select(..., selector=fn)`)
-     for the "ask a cheap model which memories matter" path — falling back to the
-     lexical engine when it is absent or errors.
-
-## Consolidation (reflection)
-
-`maybe_consolidate()` is gated like Claude Code's real implementation — a file-count
-threshold AND a minimum time interval AND a minimum number of new records since the
-last pass — then dedups by content, applies decay, and caps to `max_records`
-(evicting the weakest). An optional `reducer` hook lets an LLM do contradiction
-resolution; without it the pass is deterministic.
-
-## Storing many records (the on-disk design)
-
-Default: file-per-memory + `MEMORY.md` index (readable, cache-friendly, the right
-scale for a per-user/per-repo agent). At very large scale a flat directory of
-hundreds of thousands of files hurts the filesystem, so records shard cleanly into
-`records/<first-2-hex-of-id>/<name>.md` — see `shard_path()` and docs/MEMORY.md.
-
-Everything degrades gracefully: with no numpy / no embedding backend the store is
-lexical-only and fully functional; with no PyYAML it falls back to a minimal
-frontmatter parser.
+SQLite (`memory.db`) is the source of truth for memories; markdown is an export.
 """
 
 from __future__ import annotations
@@ -74,6 +26,15 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
+
+from context.memory_store import (
+    SCOPES,
+    VISIBILITIES,
+    Actor,
+    MemoryStore,
+    can_read,
+    can_write,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +51,7 @@ _STOPWORDS: frozenset[str] = frozenset({
 # Memory types (Claude Code's four + our two run-derived kinds).
 KINDS: frozenset[str] = frozenset({
     "user", "feedback", "project", "reference", "episodic", "semantic",
+    "conversation",  # searchable archived turns (overflow / chat history)
 })
 
 
@@ -128,23 +90,146 @@ def _rrf(rankings: Sequence[Sequence[str]], rrf_k: int = 60) -> list[tuple[str, 
 
 
 # ---------------------------------------------------------------------------
-# ShortTermMemory (session / working memory)
+# ShortTermMemory — conversation window of n queries
 # ---------------------------------------------------------------------------
 
-class ShortTermMemory:
-    """Bounded within-episode scratchpad: notes, files seen, rolling summary.
+@dataclass
+class ConversationQuery:
+    """One user query in a conversation, plus the agent replies that followed it."""
+    index: int
+    user_text: str
+    responses: list[str] = field(default_factory=list)
+    created_at: float = 0.0
 
-    Rendered into the system prompt each step so the agent keeps a compact,
-    lossless-enough trace even after the raw history window has trimmed old
-    turns — the session-memory tier that survives compaction in the reference.
+
+class ShortTermMemory:
+    """Conversation-scoped short-term memory: last *n* user queries.
+
+    This is the chat window, not the ReAct step history. Each `append_query`
+    starts a new slot; older slots fall out of the window. A small scratchpad
+    (notes / files examined / overflow summary) still rides along so a single
+    query's ReAct loop does not silently lose trimmed turns.
+
+    Bind a MemoryStore + conversation_id to persist turns across process
+    restarts; without a store it is in-memory only (tests, single run).
+
+    The *prompt* only shows the last n queries (working window). Older turns
+    stay in the store and are distilled into LongTermMemory (facts + searchable
+    conversation snippets) when `on_overflow` is set — same split ChatGPT uses
+    between the open thread and Memory / chat history.
     """
 
-    def __init__(self, max_notes: int = 12, max_summary_chars: int = 1500) -> None:
+    def __init__(
+        self,
+        window_queries: int = 10,
+        max_notes: int = 12,
+        max_summary_chars: int = 1500,
+        *,
+        store: MemoryStore | None = None,
+        user_id: str = "default",
+        conversation_id: str | None = None,
+        clock: Callable[[], float] = time.time,
+        on_overflow: Callable[[list], None] | None = None,
+    ) -> None:
+        self.window_queries = max(1, int(window_queries))
         self._notes: list[str] = []
-        self._files: list[str] = []          # ordered, de-duplicated
+        self._files: list[str] = []
         self._summary: str = ""
         self._max_notes = max_notes
         self._max_summary = max_summary_chars
+        self._queries: list[ConversationQuery] = []
+        self._store = store
+        self.user_id = user_id
+        self.conversation_id = conversation_id
+        self._clock = clock
+        self._on_overflow = on_overflow
+        if store is not None and conversation_id:
+            self._hydrate()
+
+    # -- conversation window ------------------------------------------------
+
+    def bind_conversation(self, conversation_id: str) -> None:
+        self.conversation_id = conversation_id
+        if self._store is not None:
+            self._hydrate()
+
+    def begin_query(self, text: str) -> None:
+        """Start a query slot; no-op if the current slot already has this text."""
+        text = (text or "").strip()
+        if not text:
+            return
+        if self._queries and self._queries[-1].user_text == text:
+            return
+        self.append_query(text)
+
+    def append_query(self, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        idx = (self._queries[-1].index + 1) if self._queries else 0
+        q = ConversationQuery(index=idx, user_text=text, created_at=self._clock())
+        self._queries.append(q)
+        self._persist_turn(idx, "user", text)
+        self._trim_window()
+
+    def append_response(self, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        if not self._queries:
+            self.append_query("(context)")
+        self._queries[-1].responses.append(text)
+        self._persist_turn(self._queries[-1].index, "assistant", text)
+
+    def _trim_window(self) -> None:
+        overflow = len(self._queries) - self.window_queries
+        if overflow <= 0:
+            return
+        dropped = self._queries[:overflow]
+        self._queries = self._queries[overflow:]
+        # Keep the full transcript in the store (chat-history layer). Only the
+        # in-memory prompt window shrinks. Distill durable facts via callback.
+        if self._on_overflow is not None:
+            try:
+                self._on_overflow(dropped)
+            except Exception as exc:
+                logger.debug("stm overflow distill failed: %s", exc)
+        if dropped:
+            hint = f"[archived {len(dropped)} earlier quer" + ("y]" if len(dropped) == 1 else "ies]")
+            self.fold(hint)
+
+    def _persist_turn(self, query_index: int, role: str, content: str) -> None:
+        if self._store is None or not self.conversation_id:
+            return
+        try:
+            self._store.stm_append(self.conversation_id, query_index, role, content)
+        except Exception as exc:
+            logger.debug("stm persist failed: %s", exc)
+
+    def _hydrate(self) -> None:
+        if self._store is None or not self.conversation_id:
+            return
+        rows = self._store.stm_load(self.conversation_id)
+        by_idx: dict[int, ConversationQuery] = {}
+        for row in rows:
+            idx = int(row["query_index"])
+            q = by_idx.get(idx)
+            if q is None:
+                q = ConversationQuery(index=idx, user_text="", created_at=float(row["created_at"]))
+                by_idx[idx] = q
+            if row["role"] == "user" and not q.user_text:
+                q.user_text = row["content"]
+            else:
+                q.responses.append(row["content"])
+        self._queries = [by_idx[i] for i in sorted(by_idx)]
+        if len(self._queries) > self.window_queries:
+            self._queries = self._queries[-self.window_queries:]
+
+    @property
+    def queries(self) -> list[ConversationQuery]:
+        return list(self._queries)
+
+    # -- within-query scratchpad (ReAct overflow) ---------------------------
 
     def add_note(self, text: str) -> None:
         text = (text or "").strip()
@@ -152,7 +237,7 @@ class ShortTermMemory:
             return
         self._notes.append(text)
         if len(self._notes) > self._max_notes:
-            self._notes = self._notes[-self._max_notes:]   # keep the working set
+            self._notes = self._notes[-self._max_notes:]
 
     def note_file(self, path: str) -> None:
         path = (path or "").strip()
@@ -160,7 +245,7 @@ class ShortTermMemory:
             self._files.append(path)
 
     def fold(self, evicted_text: str) -> None:
-        """Fold an evicted history turn into the rolling summary (bounded)."""
+        """Fold an evicted ReAct history turn into the overflow summary (bounded)."""
         evicted_text = (evicted_text or "").strip()
         if not evicted_text:
             return
@@ -172,10 +257,24 @@ class ShortTermMemory:
             self._summary = "…" + self._summary[-self._max_summary:]
 
     def render(self) -> str:
-        """Compact block for the system prompt; empty string when nothing to show."""
-        if not (self._notes or self._files or self._summary):
+        """Compact block for the system prompt; empty string when nothing to show.
+
+        Prior queries are one-liners (the current query already lives in
+        ConversationHistory — do not duplicate replies).
+        """
+        prior = self._queries[:-1] if self._queries else []
+        if not (prior or self._notes or self._files or self._summary):
             return ""
-        lines = ["## Working memory (this task so far)"]
+        lines: list[str] = []
+        if prior:
+            lines.append(f"## Conversation window (last {self.window_queries} queries)")
+            for q in prior:
+                text = q.user_text.replace("\n", " ")
+                if len(text) > 120:
+                    text = text[:120] + "…"
+                lines.append(f"- Q{q.index}: {text}")
+        elif self._notes or self._files or self._summary:
+            lines.append("## Working memory (this task so far)")
         if self._summary:
             lines.append(f"Earlier steps (summarized): {self._summary}")
         if self._files:
@@ -195,6 +294,49 @@ class ShortTermMemory:
         self._notes.clear()
         self._files.clear()
         self._summary = ""
+        self._queries.clear()
+        if self._store is not None and self.conversation_id:
+            try:
+                self._store.stm_clear(self.conversation_id)
+            except Exception as exc:
+                logger.debug("stm clear failed: %s", exc)
+
+    def to_state(self) -> dict:
+        return {
+            "notes": list(self._notes),
+            "files": list(self._files),
+            "summary": self._summary,
+            "window_queries": self.window_queries,
+            "user_id": self.user_id,
+            "conversation_id": self.conversation_id,
+            "queries": [
+                {
+                    "index": q.index,
+                    "user_text": q.user_text,
+                    "responses": list(q.responses),
+                    "created_at": q.created_at,
+                }
+                for q in self._queries
+            ],
+        }
+
+    def load_state(self, data: dict) -> None:
+        self._notes = list(data.get("notes", []))
+        self._files = list(data.get("files", []))
+        self._summary = str(data.get("summary", ""))
+        self.window_queries = int(data.get("window_queries", self.window_queries) or self.window_queries)
+        self.user_id = str(data.get("user_id") or self.user_id)
+        if data.get("conversation_id"):
+            self.conversation_id = str(data["conversation_id"])
+        self._queries = [
+            ConversationQuery(
+                index=int(q.get("index", i)),
+                user_text=str(q.get("user_text", "")),
+                responses=list(q.get("responses") or []),
+                created_at=float(q.get("created_at", 0.0)),
+            )
+            for i, q in enumerate(data.get("queries") or [])
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +345,7 @@ class ShortTermMemory:
 
 @dataclass
 class MemoryRecord:
-    """One long-term memory, persisted as a Markdown file with YAML frontmatter."""
+    """One long-term memory, persisted in SQLite (markdown is a cache/export)."""
     name: str                     # slug / filename stem, also the index key
     description: str              # one-line summary shown in the MEMORY.md index
     kind: str                     # one of KINDS
@@ -216,6 +358,11 @@ class MemoryRecord:
     created_at: float = 0.0
     last_access: float = 0.0
     access_count: int = 0
+    owner_user_id: str = "default"
+    conversation_id: str = ""
+    scope: str = "user"           # global | user | conversation
+    visibility: str = "private"   # public | shared | private
+    status: str = "approved"      # approved | pending
 
     @property
     def content_hash(self) -> str:
@@ -239,7 +386,8 @@ class MemoryRecord:
     # -- frontmatter (de)serialization -------------------------------------
 
     _FRONT_KEYS = ("name", "description", "kind", "tags", "files", "source",
-                   "outcome", "importance", "created_at", "last_access", "access_count")
+                   "outcome", "importance", "created_at", "last_access", "access_count",
+                   "owner_user_id", "conversation_id", "scope", "visibility", "status")
 
     def to_markdown(self) -> str:
         meta = {k: getattr(self, k) for k in self._FRONT_KEYS}
@@ -261,7 +409,23 @@ class MemoryRecord:
             created_at=float(meta.get("created_at", 0.0)),
             last_access=float(meta.get("last_access", 0.0)),
             access_count=int(meta.get("access_count", 0)),
+            owner_user_id=str(meta.get("owner_user_id", "default") or "default"),
+            conversation_id=str(meta.get("conversation_id", "") or ""),
+            scope=str(meta.get("scope", "user") or "user"),
+            visibility=str(meta.get("visibility", "private") or "private"),
+            status=str(meta.get("status", "approved") or "approved"),
         )
+
+    def to_store_dict(self) -> dict:
+        d = asdict(self)
+        d["content_hash"] = self.content_hash
+        return d
+
+    @classmethod
+    def from_store_dict(cls, d: dict) -> "MemoryRecord":
+        known = cls.__dataclass_fields__
+        payload = {k: v for k, v in d.items() if k in known}
+        return cls(**payload)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -334,17 +498,17 @@ LlmSelector = Callable[[str, "list[str]"], "list[str]"]
 # ---------------------------------------------------------------------------
 
 class LongTermMemory:
-    """Persistent, retrieval-backed memory store (markdown files + MEMORY.md index).
+    """Persistent, ACL-filtered memory (SQLite source of truth + markdown cache).
 
     Usage:
-        mem = LongTermMemory(mem_dir="~/.coding_agent/memory").load()
-        mem.remember("repo uses pytest -m slow for slow tests", kind="reference")
-        catalog = mem.index_block()           # -> put in the SYSTEM prompt
-        ctx = mem.recall("run the slow tests") # -> inject the relevant bodies
+        mem = LongTermMemory(mem_dir, user_id="alice", role="user").load()
+        mem.remember("repo uses pytest -m slow", kind="reference", visibility="private")
+        mem.as_actor("bob", role="user").recall("pytest")  # bob cannot see alice's private
     """
 
     INDEX_FILE = "MEMORY.md"
     META_FILE = ".memory_meta.json"
+    DB_FILE = "memory.db"
 
     def __init__(
         self,
@@ -357,23 +521,85 @@ class LongTermMemory:
         consolidate_min_interval_s: float = 86_400.0,
         consolidate_min_new: int = 5,
         clock: Callable[[], float] = time.time,
+        user_id: str = "default",
+        role: str = "agent",
+        conversation_id: str | None = None,
+        store: MemoryStore | None = None,
+        auto_approve: bool = True,
     ) -> None:
         self._dir = Path(mem_dir).expanduser()
-        self._embeddings = embeddings                 # optional EmbeddingBackend
+        self._embeddings = embeddings
         self._max_records = max_records
         self._half_life_s = decay_half_life_days * 86400.0
         self._consolidate_threshold = consolidate_threshold
         self._consolidate_min_interval = consolidate_min_interval_s
         self._consolidate_min_new = consolidate_min_new
         self._clock = clock
+        self._actor = Actor(user_id=user_id, role=role, conversation_id=conversation_id)
+        self._store = store
+        self.auto_approve = auto_approve
 
         self._records: list[MemoryRecord] = []
         self._by_name: dict[str, MemoryRecord] = {}
-        self._by_hash: dict[str, str] = {}            # content_hash -> name (dedup)
-        self._inverted: dict[str, set[str]] = {}      # token -> {record name}
-        self._vectors = None                          # np.ndarray aligned with _records
+        self._by_hash: dict[str, str] = {}
+        self._inverted: dict[str, set[str]] = {}
+        self._acl: dict[str, set[tuple[str, str]]] = {}
+        self._vectors = None
         self._dirty_dense = True
         self.stats: dict = {}
+
+    # -- identity -----------------------------------------------------------
+
+    @property
+    def store(self) -> MemoryStore:
+        if self._store is None:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            from context.store_factory import open_memory_store
+            self._store = open_memory_store(self._dir / self.DB_FILE, clock=self._clock)
+        return self._store
+
+    @property
+    def actor(self) -> Actor:
+        return self._actor
+
+    @property
+    def user_id(self) -> str:
+        return self._actor.user_id
+
+    def as_actor(
+        self,
+        user_id: str,
+        role: str = "user",
+        conversation_id: str | None = None,
+    ) -> "LongTermMemory":
+        """Switch the calling identity and reload the visible subset."""
+        self.store.ensure_user(user_id, role=role)
+        self._actor = Actor(user_id=user_id, role=role, conversation_id=conversation_id)
+        self._rebuild_visible()
+        return self
+
+    def new_conversation(self, title: str = "") -> str:
+        conv = self.store.create_conversation(self._actor.user_id, title=title)
+        self._actor = Actor(
+            user_id=self._actor.user_id,
+            role=self._actor.role,
+            conversation_id=conv.id,
+        )
+        return conv.id
+
+    def grant(self, name: str, principal: str, perm: str = "read") -> None:
+        """Share a record with a user (`user:alice`) or role (`role:agent`)."""
+        rec = self.store.ltm_get(name)
+        if rec is None:
+            raise KeyError(name)
+        if not can_write(self._actor, rec, self.store.acl_for(name)):
+            raise PermissionError(f"{self._actor.user_id} cannot grant on {name}")
+        self.store.acl_grant(name, principal, perm)
+        # Promote private → shared so ACL actually applies.
+        if rec.get("visibility") == "private":
+            rec["visibility"] = "shared"
+            self.store.ltm_upsert(rec)
+        self._rebuild_visible()
 
     # -- properties ---------------------------------------------------------
 
@@ -383,7 +609,16 @@ class LongTermMemory:
 
     @property
     def backend_info(self) -> str:
-        parts = ["store=markdown", f"records={len(self._records)}", "index=MEMORY.md"]
+        store_kind = getattr(self.store, "kind", "sqlite")
+        parts = [
+            f"store={store_kind}",
+            f"records={len(self._records)}",
+            f"user={self._actor.user_id}",
+            f"role={self._actor.role}",
+            "index=MEMORY.md",
+        ]
+        if self._actor.conversation_id:
+            parts.append(f"conversation={self._actor.conversation_id}")
         if self._embeddings is not None:
             parts.append(f"dense={getattr(self._embeddings, 'name', 'on')}")
         return ", ".join(parts)
@@ -391,54 +626,92 @@ class LongTermMemory:
     # -- persistence --------------------------------------------------------
 
     def load(self) -> "LongTermMemory":
-        self._records, self._by_name, self._by_hash, self._inverted = [], {}, {}, {}
-        if self._dir.exists():
-            for path in sorted(self._dir.glob("*.md")):
-                if path.name == self.INDEX_FILE:
-                    continue
-                try:
-                    rec = MemoryRecord.from_markdown(
-                        path.read_text("utf-8", errors="replace"), default_name=path.stem)
-                except Exception as exc:
-                    logger.debug("skipping unreadable memory %s: %s", path, exc)
-                    continue
-                self._index(rec)
-        self._dirty_dense = True
-        logger.info("LongTermMemory loaded: %d records from %s", len(self._records), self._dir)
+        self.store.ensure_user(self._actor.user_id, role=self._actor.role)
+        self._import_legacy_markdown()
+        self._rebuild_visible()
+        logger.info(
+            "LongTermMemory loaded: %d visible / store at %s (user=%s role=%s)",
+            len(self._records), self._dir, self._actor.user_id, self._actor.role,
+        )
         return self
+
+    def _import_legacy_markdown(self) -> None:
+        """One-shot: if SQLite is empty, ingest existing *.md records."""
+        if self.store.ltm_all():
+            return
+        if not self._dir.exists():
+            return
+        for path in sorted(self._dir.glob("*.md")):
+            if path.name == self.INDEX_FILE:
+                continue
+            try:
+                rec = MemoryRecord.from_markdown(
+                    path.read_text("utf-8", errors="replace"), default_name=path.stem)
+            except Exception as exc:
+                logger.debug("skipping unreadable memory %s: %s", path, exc)
+                continue
+            if not rec.owner_user_id:
+                rec.owner_user_id = self._actor.user_id
+            self.store.ltm_upsert(rec.to_store_dict())
+
+    def _rebuild_visible(self) -> None:
+        self._records, self._by_name, self._by_hash, self._inverted = [], {}, {}, {}
+        self._acl = self.store.acl_map()
+        for raw in self.store.ltm_all():
+            if not can_read(self._actor, raw, self._acl.get(raw["name"])):
+                continue
+            rec = MemoryRecord.from_store_dict(raw)
+            self._index(rec)
+        self._dirty_dense = True
 
     def _write_record(self, rec: MemoryRecord) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)
+        self.store.ltm_upsert(rec.to_store_dict())
         (self._dir / f"{rec.name}.md").write_text(rec.to_markdown(), encoding="utf-8")
 
     def _write_index(self) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)
         lines = ["# Memory index (long-term)", ""]
-        # Most salient first, so a truncated catalog keeps the best.
         now = self._clock()
         ordered = sorted(
             self._records,
             key=lambda r: r.effective_importance(now, self._half_life_s), reverse=True)
         lines.extend(r.index_line() for r in ordered)
-        (self._dir / self.INDEX_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        blob = "\n".join(lines) + "\n"
+        (self._dir / self.INDEX_FILE).write_text(blob, encoding="utf-8")
+        try:
+            self.store.cache_set("index", f"{self._actor.user_id}:{self._actor.role}",
+                                 blob.encode("utf-8"), ttl_s=300)
+        except Exception:
+            pass
 
-    def index_block(self, max_chars: int = 3000) -> str:
-        """The MEMORY.md catalog for the SYSTEM prompt (stable → cache friendly)."""
-        if not self._records:
+    def index_block(self, max_chars: int = 2_500) -> str:
+        """Tiny approved-fact catalog for the prompt (Claude-style bound).
+
+        Episodic run logs and pending proposals are omitted — they are recalled
+        on demand, not stuffed into every turn.
+        """
+        facts = [
+            r for r in self._records
+            if r.status == "approved" and r.kind != "episodic"
+        ]
+        if not facts:
             return ""
         now = self._clock()
         ordered = sorted(
-            self._records,
+            facts,
             key=lambda r: r.effective_importance(now, self._half_life_s), reverse=True)
-        lines = ["## Memory index (ask to recall any of these by topic)"]
+        lines = ["## Memories (approved facts; recall for detail)"]
         used = len(lines[0])
+        n = 0
         for rec in ordered:
             line = rec.index_line()
-            if used + len(line) > max_chars:
-                lines.append(f"- … ({len(ordered) - (len(lines) - 1)} more)")
+            if used + len(line) > max_chars or n >= 40:
+                lines.append(f"- … ({len(ordered) - n} more)")
                 break
             lines.append(line)
             used += len(line)
+            n += 1
         return "\n".join(lines)
 
     # -- indexing -----------------------------------------------------------
@@ -454,7 +727,7 @@ class LongTermMemory:
     def _unique_name(self, base: str) -> str:
         name = base
         i = 2
-        while name in self._by_name:
+        while name in self._by_name or self.store.ltm_get(name) is not None:
             name = f"{base}-{i}"
             i += 1
         return name
@@ -462,18 +735,33 @@ class LongTermMemory:
     # -- writing ------------------------------------------------------------
 
     def add(self, rec: MemoryRecord) -> MemoryRecord:
-        """Add a record, deduping on content. Returns the stored record."""
-        existing_name = self._by_hash.get(rec.content_hash)
-        if existing_name is not None:            # same content → reinforce, don't duplicate
-            existing = self._by_name[existing_name]
+        """Add a record, deduping on (owner, content). Returns the stored record."""
+        if rec.scope not in SCOPES:
+            rec.scope = "user"
+        if rec.visibility not in VISIBILITIES:
+            rec.visibility = "private"
+        if self._actor.role == "guest":
+            raise PermissionError("guest cannot write long-term memory")
+        if rec.scope == "global" and self._actor.role not in ("agent", "admin"):
+            rec.scope = "user"
+        existing_raw = self.store.ltm_find_hash(rec.content_hash, rec.owner_user_id)
+        if existing_raw is not None:
+            existing = MemoryRecord.from_store_dict(existing_raw)
+            if not can_write(self._actor, existing.to_store_dict(),
+                             self.store.acl_for(existing.name)):
+                raise PermissionError(f"{self._actor.user_id} cannot update {existing.name}")
             existing.access_count += 1
             existing.last_access = self._clock()
             existing.importance = min(1.0, existing.importance + 0.05)
             self._write_record(existing)
-            return existing
+            self._rebuild_visible()
+            return self._by_name.get(existing.name, existing)
         rec.name = self._unique_name(rec.name)
-        self._index(rec)
+        rec.owner_user_id = rec.owner_user_id or self._actor.user_id
+        if rec.scope == "conversation" and not rec.conversation_id:
+            rec.conversation_id = self._actor.conversation_id or ""
         self._write_record(rec)
+        self._index(rec)
         self._write_index()
         self.maybe_consolidate()
         return rec
@@ -490,6 +778,11 @@ class LongTermMemory:
         source: str = "",
         outcome: str = "",
         importance: float = 0.5,
+        scope: str = "user",
+        visibility: str = "private",
+        owner_user_id: str = "",
+        conversation_id: str = "",
+        status: str = "approved",
     ) -> MemoryRecord:
         now = self._clock()
         text = text.strip()
@@ -503,8 +796,61 @@ class LongTermMemory:
             name=base, description=desc, kind=kind, text=text,
             tags=list(tags), files=list(files), source=source, outcome=outcome,
             importance=_clamp(importance), created_at=now, last_access=now, access_count=0,
+            owner_user_id=owner_user_id or self._actor.user_id,
+            conversation_id=conversation_id or (self._actor.conversation_id or ""),
+            scope=scope if scope in SCOPES else "user",
+            visibility=visibility if visibility in VISIBILITIES else "private",
+            status=status if status in ("approved", "pending") else "approved",
         )
         return self.add(rec)
+
+    def propose(
+        self,
+        text: str,
+        *,
+        kind: str = "semantic",
+        description: str = "",
+        tags: Iterable[str] = (),
+        files: Iterable[str] = (),
+        source: str = "propose",
+        importance: float = 0.45,
+        scope: str = "user",
+        visibility: str = "public",
+    ) -> MemoryRecord:
+        """Cursor-style: stage a memory. Auto-approved when `auto_approve` is on."""
+        status = "approved" if self.auto_approve else "pending"
+        return self.remember(
+            text, kind=kind, description=description, tags=tags, files=files,
+            source=source, importance=importance, scope=scope, visibility=visibility,
+            status=status,
+        )
+
+    def approve(self, name: str) -> MemoryRecord:
+        rec = self._by_name.get(name)
+        if rec is None:
+            raw = self.store.ltm_get(name)
+            if not raw:
+                raise KeyError(name)
+            rec = MemoryRecord.from_store_dict(raw)
+        rec.status = "approved"
+        rec.last_access = self._clock()
+        self._write_record(rec)
+        self._rebuild_visible()
+        return self._by_name.get(name, rec)
+
+    def reject(self, name: str) -> None:
+        raw = self.store.ltm_get(name)
+        if raw is None:
+            raise KeyError(name)
+        if not can_write(self._actor, raw, self.store.acl_for(name)):
+            raise PermissionError(f"{self._actor.user_id} cannot reject {name}")
+        self.store.ltm_delete(name)
+        (self._dir / f"{name}.md").unlink(missing_ok=True)
+        self._rebuild_visible()
+        self._write_index()
+
+    def pending(self) -> list[MemoryRecord]:
+        return [r for r in self._records if r.status == "pending"]
 
     def record_episode(
         self,
@@ -530,35 +876,71 @@ class LongTermMemory:
             body, kind="episodic", description=f"{outcome}: {one_line}"[:120],
             tags=list(tags), files=files, source=source, outcome=outcome,
             importance=importance,
+            visibility="private",
         )
+
+    def observe_turn(self, user_text: str, assistant_text: str = "") -> list[MemoryRecord]:
+        """Extract ChatGPT-style saved memories from one user turn (no transcript dump)."""
+        from context.memory_extract import extract_durable_facts
+        written: list[MemoryRecord] = []
+        for text, kind, importance in extract_durable_facts(user_text, assistant_text):
+            rec = self.remember(
+                text, kind=kind, importance=importance, source="auto-extract",
+                visibility="private",
+            )
+            written.append(rec)
+        return written
+
+    def ingest_overflow(self, queries: list) -> list[MemoryRecord]:
+        """STM window overflow: keep facts + searchable chat-history snippets."""
+        from context.memory_extract import distill_queries
+        written: list[MemoryRecord] = []
+        for text, kind, importance in distill_queries(queries):
+            rec = self.remember(
+                text, kind=kind, importance=importance,
+                source="stm-overflow", visibility="private",
+            )
+            written.append(rec)
+        return written
 
     # -- retrieval ----------------------------------------------------------
 
     def select(
         self, query: str, k: int = 5, *, kind: str | None = None,
         selector: LlmSelector | None = None,
+        include_pending: bool = False,
+        exclude_kinds: Iterable[str] = (),
     ) -> list[tuple[MemoryRecord, float]]:
         """Rank records by relevance to `query`.
 
         With `selector` (a cheap LLM side-query taking the catalog and returning
         names), the model's picks are honored, ordered by the lexical engine and
         padded from it if the model under-selects. Without it, pure engine ranking.
+        Pending proposals are skipped unless `include_pending`.
         """
         if not self._records:
             return []
-        engine = self._engine_rank(query, k=max(k * 3, 15), kind=kind)
+        skip = set(exclude_kinds or ())
+
+        def _ok(rec: MemoryRecord) -> bool:
+            if rec.kind in skip:
+                return False
+            if rec.status != "approved" and not include_pending:
+                return False
+            return True
+
+        engine = [(r, s) for r, s in self._engine_rank(query, k=max(k * 3, 15), kind=kind) if _ok(r)]
 
         if selector is not None:
             try:
-                catalog = [r.index_line() for r, _ in self._engine_rank(query, k=30, kind=kind)]
+                catalog = [r.index_line() for r, _ in engine[:30]]
                 picks = [p for p in selector(query, catalog) if p in self._by_name]
             except Exception as exc:
                 logger.debug("memory LLM selector failed, using engine: %s", exc)
                 picks = []
             if picks:
                 pick_set = set(picks)
-                chosen = [(self._by_name[p], 1.0) for p in picks]
-                # Pad with the engine's best that the model didn't name.
+                chosen = [(self._by_name[p], 1.0) for p in picks if _ok(self._by_name[p])]
                 for rec, score in engine:
                     if rec.name not in pick_set:
                         chosen.append((rec, score))
@@ -586,9 +968,16 @@ class LongTermMemory:
         return hits
 
     def recall(self, query: str, k: int = 5, max_chars: int = 4000,
-               *, selector: LlmSelector | None = None) -> str:
-        """Formatted block of the top-k relevant memories for prompt injection."""
-        hits = self.select(query, k=k, selector=selector)
+               *, selector: LlmSelector | None = None,
+               for_prompt: bool = False) -> str:
+        """Formatted block of the top-k relevant memories for prompt injection.
+
+        `for_prompt=True` skips episodic *run logs* (agent task outcomes).
+        Conversation archives and user/project facts stay eligible — that is
+        the ChatGPT split between "saved memory" and "chat history search".
+        """
+        exclude = ("episodic",) if for_prompt else ()
+        hits = self.select(query, k=k, selector=selector, exclude_kinds=exclude)
         if not hits:
             return ""
         lines = ["## Relevant memory (recalled from past sessions)"]
@@ -617,7 +1006,9 @@ class LongTermMemory:
             if rec is None:
                 continue
             eff = rec.effective_importance(now, self._half_life_s)
-            scored.append((rec, base * (1.0 + 0.5 * eff)))
+            age_s = max(0.0, now - rec.created_at)
+            recency = 0.5 ** (age_s / (14.0 * 86400.0)) if self._half_life_s > 0 else 1.0
+            scored.append((rec, base * (0.55 + 0.45 * recency) * (1.0 + 0.4 * eff)))
         scored.sort(key=lambda rs: rs[1], reverse=True)
         return scored[:k]
 
@@ -669,9 +1060,34 @@ class LongTermMemory:
         if not self._dirty_dense or self._embeddings is None:
             return
         try:
-            import numpy as np  # noqa: F401
-            texts = [r.search_text() for r in self._records]
-            self._vectors = self._embeddings.embed(texts) if texts else None
+            import numpy as np
+            dim = int(getattr(self._embeddings, "dim", 0) or 0)
+            vecs: list[np.ndarray] = []
+            missing: list[tuple[int, str]] = []
+            for i, rec in enumerate(self._records):
+                cached = self.store.cache_get("embed", rec.content_hash)
+                if cached:
+                    arr = np.frombuffer(cached, dtype=np.float32)
+                    if dim and arr.size != dim:
+                        missing.append((i, rec.search_text()))
+                        vecs.append(np.zeros(dim, dtype=np.float32))
+                    else:
+                        vecs.append(arr)
+                else:
+                    missing.append((i, rec.search_text()))
+                    vecs.append(np.zeros(dim or 1, dtype=np.float32))
+            if missing:
+                texts = [t for _, t in missing]
+                embedded = self._embeddings.embed(texts)
+                if dim == 0 and len(embedded):
+                    dim = int(embedded.shape[1])
+                for (i, _), vec in zip(missing, embedded):
+                    vecs[i] = vec
+                    try:
+                        self.store.cache_set("embed", self._records[i].content_hash, vec.astype(np.float32).tobytes())
+                    except Exception:
+                        pass
+            self._vectors = np.vstack(vecs) if vecs else None
             self._dirty_dense = False
         except Exception as exc:
             logger.debug("memory dense build skipped: %s", exc)
@@ -737,17 +1153,17 @@ class LongTermMemory:
             survivors = survivors[: self._max_records]
 
         surviving_names = {r.name for r in survivors}
-        # Delete files that no longer survive.
-        if self._dir.exists():
-            for path in self._dir.glob("*.md"):
-                if path.name != self.INDEX_FILE and path.stem not in surviving_names:
-                    path.unlink(missing_ok=True)
+        for rec in list(self._records):
+            if rec.name in surviving_names:
+                continue
+            raw = rec.to_store_dict()
+            if can_write(self._actor, raw, self.store.acl_for(rec.name)):
+                self.store.ltm_delete(rec.name)
+                (self._dir / f"{rec.name}.md").unlink(missing_ok=True)
 
-        # Rebuild indices + rewrite survivors.
-        self._records, self._by_name, self._by_hash, self._inverted = [], {}, {}, {}
         for rec in survivors:
-            self._index(rec)
             self._write_record(rec)
+        self._rebuild_visible()
         self._write_index()
         self._write_meta({"last_consolidation": now, "count_at_last": len(self._records)})
         self.stats = {"records": len(self._records), "removed": removed}

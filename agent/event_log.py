@@ -88,18 +88,25 @@ class EventLog:
         ))
 
     def log_action(self, step: int, action: Action, raw_content: str = "",
-                   duration_ms: float | None = None) -> None:
+                   duration_ms: float | None = None,
+                   ttft_ms: float | None = None,
+                   e2e_ms: float | None = None) -> None:
         """Each decision step of the agent. raw_content is the full raw text from the model.
-        duration_ms is the LLM call latency; None when not measured."""
+        duration_ms / e2e_ms: end-to-end LLM call latency; ttft_ms: time-to-first-token when streaming."""
+        payload: dict = {
+            "step":        step,
+            "action":      action.to_dict(),
+            "raw_content": raw_content,
+            "duration_ms": duration_ms,
+        }
+        if ttft_ms is not None:
+            payload["ttft_ms"] = ttft_ms
+        if e2e_ms is not None:
+            payload["e2e_ms"] = e2e_ms
         self._append(Event(
             event_type=EventType.ACTION,
             task_id=self._current_task_id,
-            payload={
-                "step":        step,
-                "action":      action.to_dict(),
-                "raw_content": raw_content,  # raw model output including the full reasoning chain
-                "duration_ms": duration_ms,
-            },
+            payload=payload,
         ))
 
     def log_observation(self, step: int, observation: Observation,
@@ -128,6 +135,18 @@ class EventLog:
                 "step":   step,
                 "reason": reason,
                 "prompt": prompt,
+            },
+        ))
+
+    def log_checkpoint(self, step: int, checkpoint_path: str, status: str = "running") -> None:
+        """Record that a resumable checkpoint was written after this step."""
+        self._append(Event(
+            event_type=EventType.CHECKPOINT,
+            task_id=self._current_task_id,
+            payload={
+                "step": step,
+                "checkpoint_path": checkpoint_path,
+                "status": status,
             },
         ))
 
@@ -282,6 +301,7 @@ def summarize_run(log: EventLog) -> dict:
         "total_events":    len(events),
         "actions":         0,
         "reflections":     0,
+        "checkpoints":     0,
         "tool_calls":      {},   # tool_name -> count
         "tool_time_by_name": {}, # tool_name -> total seconds
         "llm_time_total":  0.0,
@@ -289,6 +309,8 @@ def summarize_run(log: EventLog) -> dict:
         "observations_ok": 0,
         "observations_err": 0,
         "final_status":    None,
+        "ttft_ms_samples": [],
+        "e2e_ms_samples":  [],
     }
 
     for event in events:
@@ -298,10 +320,15 @@ def summarize_run(log: EventLog) -> dict:
             if tc:
                 name = tc["name"]
                 stats["tool_calls"][name] = stats["tool_calls"].get(name, 0) + 1
-            # .get(): logs written before timing instrumentation have no duration.
             dur = event.payload.get("duration_ms")
             if dur is not None:
                 stats["llm_time_total"] += dur / 1000.0
+            if event.payload.get("ttft_ms") is not None:
+                stats["ttft_ms_samples"].append(float(event.payload["ttft_ms"]))
+            if event.payload.get("e2e_ms") is not None:
+                stats["e2e_ms_samples"].append(float(event.payload["e2e_ms"]))
+            elif dur is not None:
+                stats["e2e_ms_samples"].append(float(dur))
 
         elif event.event_type == EventType.OBSERVATION:
             obs = event.payload["observation"]
@@ -321,7 +348,32 @@ def summarize_run(log: EventLog) -> dict:
         elif event.event_type == EventType.REFLECTION:
             stats["reflections"] += 1
 
+        elif event.event_type == EventType.CHECKPOINT:
+            stats["checkpoints"] += 1
+
         elif event.event_type in (EventType.TASK_COMPLETE, EventType.TASK_FAILED):
             stats["final_status"] = event.event_type.value
 
+    ttft = stats["ttft_ms_samples"]
+    e2e = stats["e2e_ms_samples"]
+    if ttft:
+        stats["avg_ttft_ms"] = round(sum(ttft) / len(ttft), 2)
+        stats["p95_ttft_ms"] = round(_percentile(sorted(ttft), 95), 2)
+    if e2e:
+        stats["avg_e2e_ms"] = round(sum(e2e) / len(e2e), 2)
+        stats["p95_e2e_ms"] = round(_percentile(sorted(e2e), 95), 2)
+    del stats["ttft_ms_samples"]
+    del stats["e2e_ms_samples"]
+
     return stats
+
+
+def _percentile(sorted_vals: list[float], pct: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    k = (len(sorted_vals) - 1) * (pct / 100.0)
+    f = int(k)
+    c = min(f + 1, len(sorted_vals) - 1)
+    if f == c:
+        return sorted_vals[f]
+    return sorted_vals[f] + (sorted_vals[c] - sorted_vals[f]) * (k - f)

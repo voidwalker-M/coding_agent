@@ -19,7 +19,8 @@ Difference from repo_map.py:
    - Each chunk is annotated with its language and contained symbols.
 
 2. Vectorization (EmbeddingBackend)
-   - OpenAIEmbeddings: text-embedding-3-small (default when an API key is present)
+   - OpenAIEmbeddings: text-embedding-3-small (timeout + exponential retry)
+   - ResilientEmbeddings: fail over to same-dim HashingEmbeddings after API exhaustion
    - HashingEmbeddings: offline deterministic bag-of-tokens hashing (no key / testing)
 
 3. Hybrid retrieval (dense + sparse)
@@ -428,8 +429,24 @@ class HashingEmbeddings(EmbeddingBackend):
         return _l2_normalize(mat)
 
 
+def _is_non_retryable_embed_error(exc: BaseException) -> bool:
+    """Auth / bad-request errors should not be retried."""
+    text = str(exc).lower()
+    return any(kw in text for kw in (
+        "401", "403", "unauthorized", "forbidden", "invalid api key",
+        "authentication", "400", "invalid_request", "not found",
+    ))
+
+
 class OpenAIEmbeddings(EmbeddingBackend):
-    """OpenAI embeddings (text-embedding-3-small). Reuses the installed openai SDK."""
+    """
+    OpenAI embeddings (text-embedding-3-small). Reuses the installed openai SDK.
+
+    Fault tolerance:
+      - ``timeout``: per-request HTTP timeout (seconds)
+      - ``max_retries`` + ``retry_delay``: exponential back-off on transient failures
+      - non-retryable: 401/403/400 (raised immediately)
+    """
 
     def __init__(
         self,
@@ -438,12 +455,19 @@ class OpenAIEmbeddings(EmbeddingBackend):
         base_url: str | None = None,
         dim: int = 1536,
         batch_size: int = 128,
+        timeout: float = 30.0,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
     ) -> None:
         from openai import OpenAI
-        self._client = OpenAI(api_key=api_key, base_url=base_url)
+        self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
         self._model = model
         self._dim = dim
         self._batch = batch_size
+        self._timeout = timeout
+        self._max_retries = max(1, max_retries)
+        self._retry_delay = max(0.0, retry_delay)
+        self.stats: dict = {"calls": 0, "retries": 0, "failures": 0}
 
     @property
     def dim(self) -> int:
@@ -453,11 +477,34 @@ class OpenAIEmbeddings(EmbeddingBackend):
     def name(self) -> str:
         return f"openai:{self._model}"
 
+    def _create_batch(self, batch: list[str]):
+        import time as _time
+        delay = self._retry_delay
+        last_exc: Exception | None = None
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                self.stats["calls"] += 1
+                return self._client.embeddings.create(model=self._model, input=batch)
+            except Exception as exc:
+                last_exc = exc
+                self.stats["failures"] += 1
+                if _is_non_retryable_embed_error(exc):
+                    raise
+                if attempt < self._max_retries:
+                    self.stats["retries"] += 1
+                    logger.warning(
+                        "Embedding API failed (attempt %d/%d): %s — retrying in %.1fs",
+                        attempt, self._max_retries, exc, delay,
+                    )
+                    _time.sleep(delay)
+                    delay = delay * 2 if delay > 0 else 0.0
+        raise last_exc  # type: ignore[misc]
+
     def embed(self, texts: Sequence[str]) -> np.ndarray:
         vectors: list[list[float]] = []
         for start in range(0, len(texts), self._batch):
             batch = list(texts[start:start + self._batch])
-            resp = self._client.embeddings.create(model=self._model, input=batch)
+            resp = self._create_batch(batch)
             vectors.extend(item.embedding for item in resp.data)
         mat = np.asarray(vectors, dtype=np.float32)
         if mat.size == 0:
@@ -465,16 +512,85 @@ class OpenAIEmbeddings(EmbeddingBackend):
         return _l2_normalize(mat)
 
 
+class ResilientEmbeddings(EmbeddingBackend):
+    """
+    Primary embedding backend with same-dimension offline fallback.
+
+    On embed() failure after the primary's own retries, permanently fail over to
+    ``fallback`` (typically HashingEmbeddings with matching ``dim``) so build /
+    retrieve can continue without the embedding API.
+    """
+
+    def __init__(
+        self,
+        primary: EmbeddingBackend,
+        fallback: EmbeddingBackend | None = None,
+    ) -> None:
+        if fallback is None:
+            fallback = HashingEmbeddings(dim=primary.dim)
+        if fallback.dim != primary.dim:
+            raise ValueError(
+                f"fallback dim {fallback.dim} must match primary dim {primary.dim}"
+            )
+        self._primary = primary
+        self._fallback = fallback
+        self._using_fallback = False
+        self.stats: dict = {
+            "primary_calls": 0,
+            "fallback_calls": 0,
+            "failovers": 0,
+        }
+
+    @property
+    def dim(self) -> int:
+        return self._primary.dim
+
+    @property
+    def name(self) -> str:
+        if self._using_fallback:
+            return f"resilient({self._fallback.name})"
+        return f"resilient({self._primary.name}|{self._fallback.name})"
+
+    @property
+    def using_fallback(self) -> bool:
+        return self._using_fallback
+
+    def embed(self, texts: Sequence[str]) -> np.ndarray:
+        if self._using_fallback:
+            self.stats["fallback_calls"] += 1
+            return self._fallback.embed(texts)
+        try:
+            self.stats["primary_calls"] += 1
+            return self._primary.embed(texts)
+        except Exception as exc:
+            logger.warning(
+                "Primary embeddings failed (%s); failing over to %s",
+                exc, self._fallback.name,
+            )
+            self._using_fallback = True
+            self.stats["failovers"] += 1
+            self.stats["fallback_calls"] += 1
+            return self._fallback.embed(texts)
+
+
 def create_embedding_backend(
     provider: str = "auto",
     api_key: str | None = None,
     base_url: str | None = None,
+    *,
+    timeout: float = 30.0,
+    max_retries: int = 3,
+    retry_delay: float = 1.0,
+    resilient: bool = True,
 ) -> EmbeddingBackend:
     """
     Select the embedding backend:
         "auto"    → OpenAI when OPENAI_API_KEY is set, otherwise HashingEmbeddings (offline)
         "openai"  → force OpenAI
         "hashing" → force offline hashing embeddings
+
+    When OpenAI is selected and ``resilient=True``, wrap with ResilientEmbeddings so
+    transient / hard API failures fall back to same-dim HashingEmbeddings.
     """
     provider = (provider or "auto").lower()
     if provider == "hashing":
@@ -483,7 +599,16 @@ def create_embedding_backend(
     key = api_key or os.environ.get("OPENAI_API_KEY", "")
     if provider == "openai" or (provider == "auto" and key):
         try:
-            return OpenAIEmbeddings(api_key=key or None, base_url=base_url)
+            primary = OpenAIEmbeddings(
+                api_key=key or None,
+                base_url=base_url,
+                timeout=timeout,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+            )
+            if resilient:
+                return ResilientEmbeddings(primary, HashingEmbeddings(dim=primary.dim))
+            return primary
         except Exception as exc:
             logger.warning("OpenAI embeddings unavailable (%s), falling back to hashing", exc)
     return HashingEmbeddings()
@@ -1003,6 +1128,8 @@ class RagRetriever:
             "reused_files": reused,
             "reembedded_files": reembedded,
             "embedded_chunks": embedded_chunks,
+            "cache_hit_rate": round(reused / len(ordered), 4) if ordered else 0.0,
+            "cache_miss_rate": round(reembedded / len(ordered), 4) if ordered else 0.0,
             "build_seconds": round(time.time() - t0, 4),
             "backend": self.backend_info,
         }
@@ -1085,11 +1212,20 @@ def evaluate_recall(
     """
     Offline retrieval evaluation. cases: [{"query": str, "relevant_files": {...}}],
     where relevant_files is the set of relevant file names for that query.
-    Returns recall@k / MRR / hit@k.
+
+    Returns aggregate recall@k / MRR / hit@k, plus min/max across cases and per_case detail
+    so callers can report best/worst query performance.
     """
+    empty = {
+        "recall@k": 0.0, "mrr": 0.0, "hit@k": 0.0,
+        "recall@k_min": 0.0, "recall@k_max": 0.0,
+        "mrr_min": 0.0, "mrr_max": 0.0,
+        "n": 0, "k": k, "per_case": [],
+    }
     if not cases:
-        return {"recall@k": 0.0, "mrr": 0.0, "hit@k": 0.0, "n": 0, "k": k}
+        return empty
     recalls, rr, hits = [], [], 0
+    per_case: list[dict] = []
     for case in cases:
         gold = set(case.get(relevance_key, []))
         if not gold:
@@ -1097,17 +1233,36 @@ def evaluate_recall(
         retrieved = retriever.retrieve_chunks(case["query"], k=k)
         files = [c.file for c, _ in retrieved]
         found = [f for f in files if f in gold]
-        recalls.append(len(set(found) & gold) / len(gold))
+        recall = len(set(found) & gold) / len(gold)
         if found:
             hits += 1
             first = next(i for i, f in enumerate(files) if f in gold)
-            rr.append(1.0 / (first + 1))
+            mrr_i = 1.0 / (first + 1)
         else:
-            rr.append(0.0)
+            mrr_i = 0.0
+        recalls.append(recall)
+        rr.append(mrr_i)
+        per_case.append({
+            "id": case.get("id"),
+            "query": case["query"],
+            "gold": sorted(gold),
+            "retrieved": files,
+            "recall@k": round(recall, 4),
+            "mrr": round(mrr_i, 4),
+            "hit": bool(found),
+        })
     n = len(recalls)
+    if not n:
+        return empty
     return {
-        "recall@k": round(sum(recalls) / n, 4) if n else 0.0,
-        "mrr": round(sum(rr) / n, 4) if n else 0.0,
-        "hit@k": round(hits / n, 4) if n else 0.0,
-        "n": n, "k": k,
+        "recall@k": round(sum(recalls) / n, 4),
+        "mrr": round(sum(rr) / n, 4),
+        "hit@k": round(hits / n, 4),
+        "recall@k_min": round(min(recalls), 4),
+        "recall@k_max": round(max(recalls), 4),
+        "mrr_min": round(min(rr), 4),
+        "mrr_max": round(max(rr), 4),
+        "n": n,
+        "k": k,
+        "per_case": per_case,
     }

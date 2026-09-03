@@ -97,7 +97,9 @@ def _real_factory(config, retriever_kind: str, engine: str, max_steps_override,
         if id_to_rec and spec.id in id_to_rec:
             from benchmarks.swebench import venv_runtime_for
             runtime = venv_runtime_for(id_to_rec[spec.id])
-        registry = _build_registry(config, runtime=runtime)
+        registry = _build_registry(
+            config, runtime=runtime, repo_path=repo_path, block_test_edits=True,
+        )
         rag = _build_retriever(repo_path, retriever_kind)
         agent_cfg = AgentConfig(
             max_steps=spec.max_steps if max_steps_override is None else max_steps_override,
@@ -107,7 +109,21 @@ def _real_factory(config, retriever_kind: str, engine: str, max_steps_override,
             # code change, so refuse a "finish" that edited nothing — pushes the
             # model to actually apply its fix instead of just describing it.
             require_edit_before_finish=True,
+            # Do NOT require a green test before the coder can finish.
+            # That gate burned the step budget on untested patches (v2: 1/14).
+            # Pair/pipeline still enforce tests on the reviewer role.
+            require_test_before_finish=False,
+            # Force search_text/find_symbol before the first edit so the model
+            # does not patch a nearby file that merely looks related.
+            require_locate_before_edit=True,
         )
+        if engine in ("pair", "pipeline"):
+            from agent.orchestrator import Orchestrator, OrchestratorAgent
+            orch = Orchestrator(
+                backend, registry, agent_cfg,
+                max_iterations=2, topology=engine,
+            )
+            return OrchestratorAgent(orch)
         if engine == "langgraph":
             from agent.langgraph_loop import LangGraphAgent
             return LangGraphAgent(backend, registry, agent_cfg)
@@ -131,7 +147,10 @@ def main() -> int:
     ap.add_argument("--test-timeout", type=int, default=1200, help="Per test-run timeout (s)")
     ap.add_argument("-m", "--model", default=None, help="Override model")
     ap.add_argument("-p", "--provider", default=None, help="Override provider")
-    ap.add_argument("-e", "--engine", choices=["native", "langgraph"], default="native")
+    ap.add_argument("-e", "--engine",
+                    choices=["native", "langgraph", "pair", "pipeline"],
+                    default="native",
+                    help="native ReAct, LangGraph, or multi-agent (pair=coder⟲reviewer)")
     ap.add_argument("-R", "--retriever", choices=["none", "rag"], default="none")
     ap.add_argument("-o", "--output", default=None, help="Save JSON report here")
     ap.add_argument("--results-dir", default="./eval_runs/swebench", help="Workdir/log root")

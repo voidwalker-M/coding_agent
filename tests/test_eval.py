@@ -50,10 +50,12 @@ def test_file_contains_verifier(tmp_path):
 
 
 def test_command_verifier(tmp_path):
+    import sys
     (tmp_path / "hello.py").write_text("print('hello world')")
-    ok, _ = CommandVerifier("python hello.py", expect_substring="hello world")(str(tmp_path))
+    cmd = f"{sys.executable} hello.py"
+    ok, _ = CommandVerifier(cmd, expect_substring="hello world")(str(tmp_path))
     assert ok is True
-    bad, _ = CommandVerifier("python hello.py", expect_substring="nope")(str(tmp_path))
+    bad, _ = CommandVerifier(cmd, expect_substring="nope")(str(tmp_path))
     assert bad is False
 
 

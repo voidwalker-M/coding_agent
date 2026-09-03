@@ -12,7 +12,9 @@ Key design decisions:
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -83,9 +85,11 @@ class PytestTool(BaseTool):
 
         extra_args = params.get("args", "")
 
+        # Host venv: sys.executable. Docker sandbox images have `python` on PATH.
+        py = "python" if self._runtime.__class__.__name__ == "DockerRuntime" else sys.executable
         # --tb=short gives enough detail for the agent; --no-header reduces noise
         cmd_parts = [
-            "python", "-m", "pytest",
+            py, "-m", "pytest",
             test_path,
             "--tb=short",
             "--no-header",
@@ -94,7 +98,7 @@ class PytestTool(BaseTool):
         if extra_args:
             cmd_parts.extend(extra_args.split())
 
-        cmd_str = " ".join(cmd_parts)
+        cmd_str = " ".join(shlex.quote(p) for p in cmd_parts)
         run_result = self._runtime.exec(cmd_str, cwd=cwd, timeout=PYTEST_TIMEOUT)
         if "timed out" in run_result.stderr.lower():
             return ToolResult(

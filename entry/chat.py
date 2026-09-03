@@ -167,14 +167,24 @@ class ChatSession:
     - repo_map cache (auto-invalidated when the repo changes)
     """
 
-    def __init__(self, backend, registry, config, repo_path: str, log_dir: str, confirm_callback=None) -> None:
+    def __init__(self, backend, registry, config, repo_path: str, log_dir: str, confirm_callback=None,
+                 short_term_memory=None, long_term_memory=None) -> None:
         from agent.core import Agent, AgentConfig
+        from config.schema import agent_compaction_kwargs
         from context.history import ConversationHistory
 
         self.repo_path = repo_path
         self.log_dir = log_dir
         self.config = config
         self._confirm_callback = confirm_callback
+        self._long_term = long_term_memory
+        if short_term_memory is None:
+            from context.memory import ShortTermMemory
+            overflow = long_term_memory.ingest_overflow if long_term_memory is not None else None
+            short_term_memory = ShortTermMemory(
+                window_queries=getattr(config.memory, "window_queries", 10),
+                on_overflow=overflow,
+            )
 
         # Streaming callbacks: flush each token to the terminal immediately
         _stream_started = [False]
@@ -231,8 +241,15 @@ class ChatSession:
             thought_callback=_thought_cb,
             confirm_dangerous=confirm_callback is not None,
             confirm_callback=confirm_callback,
+            short_term_memory=short_term_memory,
+            long_term_memory=long_term_memory,
+            memory_top_k=getattr(config.memory, "top_k", 4),
+            memory_window_queries=getattr(config.memory, "window_queries", 10),
+            capture_episodes=getattr(config.memory, "capture_episodes", True),
+            **agent_compaction_kwargs(config.context),
         )
         self.agent = Agent(backend, registry, agent_cfg)
+        self._short_term = short_term_memory
         self._shared_history = ConversationHistory(
             max_messages=config.context.history_window * 2
         )
@@ -264,8 +281,10 @@ class ChatSession:
         # and printed again.
         self._reset_stream_state()
 
-        # Append the user's input to the shared history
+        # Append the user's input to the shared history AND the STM query window
         self._shared_history.add(LLMMessage(role="user", content=user_input))
+        if self._short_term is not None and hasattr(self._short_term, "begin_query"):
+            self._short_term.begin_query(user_input)
 
         # Build the Task for this round (repo_path is fixed; description is the user input)
         task = Task(
@@ -295,6 +314,13 @@ class ChatSession:
                 role="assistant",
                 content=f"[Round {self.round_count} complete]\n{result.summary}",
             ))
+            if self._short_term is not None and hasattr(self._short_term, "append_response"):
+                self._short_term.append_response(result.summary)
+            if self._long_term is not None and hasattr(self._long_term, "observe_turn"):
+                try:
+                    self._long_term.observe_turn(user_input, result.summary)
+                except Exception:
+                    pass
 
         # Print a newline after streaming output; reset readline line state
         import sys as _sys

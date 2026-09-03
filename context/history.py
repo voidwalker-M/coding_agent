@@ -99,6 +99,11 @@ class ConversationHistory:
         if self._messages:
             self._messages = [self._messages[0]]
 
+    def replace_messages(self, messages: list[LLMMessage]) -> None:
+        """Replace the entire history (used after LLM compaction)."""
+        self._messages = list(messages)
+        self._trim()
+
     def _trim(self) -> None:
         """When max_messages is exceeded, discard the oldest message starting from index 1."""
         while len(self._messages) > self._max:
